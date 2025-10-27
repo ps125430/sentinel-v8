@@ -136,12 +136,12 @@ def render_digest(phase: str, L: List[Dict], S: List[Dict], news: List[str]) -> 
     st = "、".join([f"{x['symbol']}({x['score_total']})" for x in S]) or "—"
     nt = " | ".join(news[:3]) if news else "—"
     return (
-        f"【{phase}報】{now_tz().strftime('%Y-%m-%d %H:%M')}\n"
-        f"🚀 做多候選：{lt}\n"
-        f"🧊 做空候選：{st}\n"
-        f"📰 熱點：{nt}\n"
-        f"（中性：多≥{TH_LONG}、空≥{TH_SHORT}；強度比重 {int(W_STRONG*100)}%）"
-    )
+    f"【{phase}報】{now_tz().strftime('%Y-%m-%d %H:%M')}\n"
+    f"🚀 做多候選：{ '、'.join([f\"{x['symbol']}({x['score_total']})\" for x in L]) or '—' }\n"
+    f"🧊 做空候選：{ '、'.join([f\"{x['symbol']}({x['score_total']})\" for x in S]) or '—' }\n"
+    f"(中性模式｜強度 {int(W_STRONG*100)}%)"
+)
+
 
 # ------------------ 口令（含今日強勢 / 今日弱勢） ------------------
 tasks = {}
