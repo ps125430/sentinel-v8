@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import os, json, logging, re, math
 import httpx
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
 # LINE
 from linebot import LineBotApi
@@ -26,16 +26,18 @@ line_api = LineBotApi(LINE_TOKEN) if LINE_TOKEN else None
 
 # 觀察名單（CoinGecko 的 id）
 WATCHLIST_CRYPTOS = [s.strip() for s in os.getenv(
-    "WATCHLIST_CRYPTOS", "bitcoin,ethereum,solana,binancecoin,avalanche-2,chainlink"
+    "WATCHLIST_CRYPTOS",
+    "bitcoin,ethereum,solana,dogecoin,cardano,ripple,chainlink,wrapped-bitcoin,polkadot,matic-network,avalanche-2,uniswap"
 ).split(",") if s.strip()]
 
-# 分數權重（中性維持 0.6 強度、0.4 新聞；新聞先 0）
+# 分數權重與門檻（中性）
 W_STRONG = float(os.getenv("W_STRONG", "0.60"))
 W_NEWS   = float(os.getenv("W_NEWS", "0.40"))
+TH_LONG  = int(os.getenv("TH_LONG", "70"))  # 做多門檻
+TH_SHORT = int(os.getenv("TH_SHORT", "65"))  # 做空門檻
 
-# 中性門檻（比保守略低）
-TH_LONG  = int(os.getenv("TH_LONG", "70"))
-TH_SHORT = int(os.getenv("TH_SHORT", "65"))
+# 是否在強弱清單中加入「建議」標示（✅）
+AUTO_SUGGEST = int(os.getenv("AUTO_SUGGEST", "1"))  # 1 開啟（預設），0 關閉
 
 def now_tz() -> datetime:
     return datetime.now(TZ)
@@ -53,12 +55,25 @@ def push_text(text: str, to: str | None = None) -> Dict:
         logger.exception("LINE push failed: %s", e)
         return {"sent": False, "error": str(e)}
 
-# ------------------ 市場數據（CoinGecko 無金鑰） ------------------
+# ------------------ 市場數據：CoinGecko → Binance 容錯 ------------------
 CG_BASE = "https://api.coingecko.com/api/v3"
+BINANCE_MAP = {
+    "bitcoin": "BTCUSDT",
+    "ethereum": "ETHUSDT",
+    "solana": "SOLUSDT",
+    "dogecoin": "DOGEUSDT",
+    "cardano": "ADAUSDT",
+    "ripple": "XRPUSDT",
+    "chainlink": "LINKUSDT",
+    "avalanche-2": "AVAXUSDT",
+    "polkadot": "DOTUSDT",
+    "matic-network": "MATICUSDT",
+    "uniswap": "UNIUSDT",
+    "wrapped-bitcoin": "BTCUSDT",
+}
 
-async def fetch_crypto_markets(ids: List[str]) -> List[Dict]:
-    if not ids:
-        return []
+async def fetch_coingecko_markets(ids: List[str]) -> List[Dict]:
+    if not ids: return []
     url = f"{CG_BASE}/coins/markets"
     params = {
         "vs_currency": "usd",
@@ -68,24 +83,57 @@ async def fetch_crypto_markets(ids: List[str]) -> List[Dict]:
         "page": 1,
         "price_change_percentage": "1h,24h"
     }
+    headers = {"User-Agent": "sentinel-v8/1.0"}
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=20.0, headers=headers) as client:
             r = await client.get(url, params=params)
             r.raise_for_status()
-            return r.json()
+            data = r.json()
+            return data if isinstance(data, list) else []
     except Exception as e:
-        logger.exception("coingecko failed: %s", e)
+        logger.warning("coingecko failed: %s", e)
         return []
 
+async def fetch_binance_markets(ids: List[str]) -> List[Dict]:
+    if not ids: return []
+    symbols = [BINANCE_MAP[sid] for sid in ids if sid in BINANCE_MAP]
+    if not symbols: return []
+    url = "https://api.binance.com/api/v3/ticker/24hr"
+    try:
+        rows = []
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            for sym in symbols:
+                r = await client.get(url, params={"symbol": sym})
+                r.raise_for_status()
+                j = r.json()
+                price = float(j.get("lastPrice", 0.0))
+                chg_pct = float(j.get("priceChangePercent", 0.0))
+                vol = float(j.get("quoteVolume", 0.0))
+                cid = next((k for k, v in BINANCE_MAP.items() if v == sym), sym.lower())
+                rows.append({
+                    "id": cid,
+                    "symbol": sym.replace("USDT", ""),
+                    "name": cid,
+                    "current_price": price,
+                    "price_change_percentage_24h": chg_pct,
+                    "total_volume": vol,
+                })
+        return rows
+    except Exception as e:
+        logger.warning("binance failed: %s", e)
+        return []
+
+async def fetch_markets(ids: List[str]) -> List[Dict]:
+    data = await fetch_coingecko_markets(ids)
+    return data if data else await fetch_binance_markets(ids)
+
 def normalize(x: float, lo: float, hi: float) -> float:
-    if hi <= lo:
-        return 0.5
+    if hi <= lo: return 0.5
     v = (x - lo) / (hi - lo)
     return max(0.0, min(1.0, v))
 
 def score_strong(rows: List[Dict]) -> List[Dict]:
-    if not rows:
-        return []
+    if not rows: return []
     chg_vals = [float(row.get("price_change_percentage_24h") or 0.0) for row in rows]
     vol_vals = [float(row.get("total_volume") or 0.0) for row in rows]
     lo_chg, hi_chg = min(chg_vals), max(chg_vals)
@@ -97,12 +145,10 @@ def score_strong(rows: List[Dict]) -> List[Dict]:
         name = row.get("name") or ""
         chg = float(row.get("price_change_percentage_24h") or 0.0)
         vol = float(row.get("total_volume") or 0.0)
-        price = row.get("current_price")
-
+        price = float(row.get("current_price") or 0.0)
         s_chg = normalize(chg, lo_chg, hi_chg)
         s_vol = normalize(math.log1p(vol), math.log1p(lo_vol), math.log1p(hi_vol))
-        s = (s_chg * 0.6 + s_vol * 0.4) * 100  # 強度分數 0~100
-
+        s = (s_chg * 0.6 + s_vol * 0.4) * 100
         out.append({
             "id": row.get("id"),
             "symbol": sym,
@@ -111,7 +157,7 @@ def score_strong(rows: List[Dict]) -> List[Dict]:
             "chg24h": chg,
             "volume": vol,
             "score_strong": round(s, 1),
-            "score_news": 0.0,  # 之後可接新聞
+            "score_news": 0.0,
         })
     return out
 
@@ -123,27 +169,34 @@ def split_long_short(rows: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
     for r in rows:
         tot = total_score(r["score_strong"], r["score_news"])
         item = {**r, "score_total": tot}
-        if tot >= TH_LONG:
-            L.append(item)
-        elif tot >= TH_SHORT:
-            S.append(item)
+        if tot >= TH_LONG: L.append(item)
+        elif tot >= TH_SHORT: S.append(item)
     L.sort(key=lambda x: x["score_total"], reverse=True)
     S.sort(key=lambda x: x["score_total"], reverse=True)
     return L[:5], S[:5]
 
-def render_digest(phase: str, L: List[Dict], S: List[Dict], news: List[str]) -> str:
-    lt = "、".join([f"{x['symbol']}({x['score_total']})" for x in L]) or "—"
-    st = "、".join([f"{x['symbol']}({x['score_total']})" for x in S]) or "—"
-    nt = " | ".join(news[:3]) if news else "—"
+# ------- 文案（A：行情氣氛派）＋建議標示 -------
+def _fmt_row_with_suggest(item: Dict, side_hint: Optional[str] = None) -> str:
+    sym = item["symbol"]
+    score = item["score_total"]
+    if AUTO_SUGGEST:
+        if score >= TH_LONG:
+            return f"{sym}({score}) ✅ 建議做多"
+        if score >= TH_SHORT and (side_hint == "short" or side_hint is None):
+            return f"{sym}({score}) ✅ 建議做空"
+    return f"{sym}({score})"
+
+def render_digest(phase: str, L, S, news):
+    lt = "、".join([_fmt_row_with_suggest(x, "long") for x in L]) or "—"
+    st = "、".join([_fmt_row_with_suggest(x, "short") for x in S]) or "—"
     return (
-    f"【{phase}報】{now_tz().strftime('%Y-%m-%d %H:%M')}\n"
-    f"🚀 做多候選：{ '、'.join([f\"{x['symbol']}({x['score_total']})\" for x in L]) or '—' }\n"
-    f"🧊 做空候選：{ '、'.join([f\"{x['symbol']}({x['score_total']})\" for x in S]) or '—' }\n"
-    f"(中性模式｜強度 {int(W_STRONG*100)}%)"
-)
+        f"【{phase}報】{now_tz().strftime('%Y-%m-%d %H:%M')}\n"
+        f"🚀 做多候選：{lt}\n"
+        f"🧊 做空候選：{st}\n"
+        f"(中性模式｜多≥{TH_LONG}、空≥{TH_SHORT}｜強度 {int(W_STRONG*100)}%)"
+    )
 
-
-# ------------------ 口令（含今日強勢 / 今日弱勢） ------------------
+# ------------------ 口令＋監控 ------------------
 tasks = {}
 cmd_long  = re.compile(r"^\s*([A-Za-z0-9_\-./]+)\s*(做多|多|long)\s*$")
 cmd_short = re.compile(r"^\s*([A-Za-z0-9_\-./]+)\s*(做空|空|short)\s*$")
@@ -158,10 +211,11 @@ def status_list():
         items.append(f"{s} {v['side']}（剩 {max(left,0)} 分）")
     return "、".join(items) if items else "（無監控）"
 
+scheduler = BackgroundScheduler(timezone=TZ)
+
 def schedule_end(symbol: str):
     job = tasks.get(symbol)
-    if not job:
-        return
+    if not job: return
     until: datetime = job["until"]
     remind_at = until - timedelta(minutes=5)
     if remind_at > now_tz():
@@ -193,28 +247,26 @@ def stop_task(symbol: str):
     else:
         push_text(f"ℹ️ {symbol} 目前沒有進行中的監控")
 
+# ------- 「今日強勢 / 今日弱勢」：加上建議標示 -------
 async def today_strength(msg: str):
-    rows = await fetch_crypto_markets(WATCHLIST_CRYPTOS)
-    rows = score_strong(rows)
-
-    # 排序強弱
+    mkt = await fetch_markets(WATCHLIST_CRYPTOS)
+    rows = score_strong(mkt)
+    # 補總分用於判斷
+    for r in rows:
+        r["score_total"] = total_score(r["score_strong"], r["score_news"])
     strong_sorted = sorted(rows, key=lambda x: x["score_strong"], reverse=True)
     weak_sorted   = list(reversed(strong_sorted))
-
     top3_strong = strong_sorted[:3]
     top3_weak   = weak_sorted[:3]
 
     if "弱" in msg:
-        text = "🧊 今日弱勢\n" + "\n".join(
-            [f"{i+1}. {x['symbol']}  {x['score_strong']}" for i, x in enumerate(top3_weak)]
-        )
+        lines = [f"{i+1}. {_fmt_row_with_suggest(x, 'short')}" for i, x in enumerate(top3_weak)]
+        text = "🧊 今日弱勢\n" + "\n".join(lines)
     else:
-        text = "🚀 今日強勢\n" + "\n".join(
-            [f"{i+1}. {x['symbol']}  {x['score_strong']}" for i, x in enumerate(top3_strong)]
-        )
+        lines = [f"{i+1}. {_fmt_row_with_suggest(x, 'long')}" for i, x in enumerate(top3_strong)]
+        text = "🚀 今日強勢\n" + "\n".join(lines)
 
-    push_text(text)
-
+    push_text(text if text.strip() else "（目前資料暫無，稍後再試）")
 
 def help_text() -> str:
     return ("指令例：\n"
@@ -237,7 +289,6 @@ def handle_command_sync(text: str, owner: str):
         return "ok"
     m = cmd_stop.match(t)
     if m: stop_task(m.group(1).upper()); return "ok"
-    # 需要 async 的（今日強/弱勢）交給 webhook 裡面處理
     return "async-needed" if t in {"今日強勢","今日弱勢"} else "help"
 
 # ------------------ 路由 ------------------
@@ -253,8 +304,11 @@ def healthz():
 async def report(type: str, raw: int = 0):
     if type not in {"morning","noon","evening","night"}:
         return {"ok": False, "error": "invalid type"}
-    mkt = await fetch_crypto_markets(WATCHLIST_CRYPTOS)
+    mkt = await fetch_markets(WATCHLIST_CRYPTOS)
     rows = score_strong(mkt)
+    # 加總分
+    for r in rows:
+        r["score_total"] = total_score(r["score_strong"], r["score_news"])
     L, S = split_long_short(rows)
     resp = {
         "ok": True,
@@ -265,17 +319,15 @@ async def report(type: str, raw: int = 0):
         "top_news": []
     }
     if raw:
-        # 加上原始強度分數表，便於診斷
         resp["raw_strength"] = rows
     return resp
 
-def _title(phase: str): 
-    return f"【{phase}報】sentinel-v8 {now_tz().strftime('%Y-%m-%d %H:%M')}"
-
 @app.get("/admin/push")
 async def push_alias(type: str):
-    mkt = await fetch_crypto_markets(WATCHLIST_CRYPTOS)
+    mkt = await fetch_markets(WATCHLIST_CRYPTOS)
     rows = score_strong(mkt)
+    for r in rows:
+        r["score_total"] = total_score(r["score_strong"], r["score_news"])
     L, S = split_long_short(rows)
     text = render_digest(type, L, S, news=[])
     res = push_text(text)
@@ -289,7 +341,7 @@ async def push_report_get(type: str):
 async def push_report_post(type: str):
     return await push_alias(type)
 
-# Webhook：含「今日強勢 / 今日弱勢」即時回覆
+# Webhook：含「今日強勢 / 今日弱勢」
 @app.post("/line/webhook")
 async def line_webhook(req: Request):
     body = await req.body()
@@ -297,7 +349,6 @@ async def line_webhook(req: Request):
         data = json.loads(body.decode("utf-8"))
     except:
         data = {}
-
     try:
         events = data.get("events", [])
         for ev in events:
@@ -306,7 +357,6 @@ async def line_webhook(req: Request):
             msg = ev.get("message", {}) or {}
             text = (msg.get("text") or "").strip()
             logger.info("[LINE] src uid=%s gid=%s rid=%s text=%s", uid, gid, rid, text)
-
             mode = handle_command_sync(text, owner=uid or gid or rid or "")
             if mode == "async-needed":
                 await today_strength(text)
@@ -314,17 +364,16 @@ async def line_webhook(req: Request):
                 push_text(help_text())
     except Exception as e:
         logger.exception("Webhook parse error: %s", e)
-
     return {"ok": True, "handled": True}
 
-# 自動推播排程（中性門檻）
-scheduler = BackgroundScheduler(timezone=TZ)
-
+# 自動推播排程
 def schedule_tick(label: str):
     async def _run():
         try:
-            mkt = await fetch_crypto_markets(WATCHLIST_CRYPTOS)
+            mkt = await fetch_markets(WATCHLIST_CRYPTOS)
             rows = score_strong(mkt)
+            for r in rows:
+                r["score_total"] = total_score(r["score_strong"], r["score_news"])
             L, S = split_long_short(rows)
             text = render_digest(label, L, S, news=[])
             push_text(text)
@@ -332,6 +381,8 @@ def schedule_tick(label: str):
             logger.exception("tick failed: %s", e)
     import anyio
     anyio.from_thread.run(anyio.run, _run)
+
+scheduler = BackgroundScheduler(timezone=TZ)
 
 @app.on_event("startup")
 def start_scheduler():
