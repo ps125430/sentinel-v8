@@ -1,46 +1,56 @@
 # app/trend_integrator.py
 import os
 from typing import List, Dict
-from app.trend import classify, Bar
-from app.market import get_recent_bars  # 你現有的取K線/成交量方法
 
+TH_LONG  = float(os.getenv("TH_LONG", "70"))
+TH_SHORT = float(os.getenv("TH_SHORT", "65"))
 ENABLE_TREND_MODEL = os.getenv("ENABLE_TREND_MODEL", "false").lower() == "true"
 
-def annotate_with_trend(results: List[Dict]) -> List[Dict]:
-    """
-    傳入你的 raw_strength（或排行榜）list[dict]，
-    每個 item 需至少有:
-      - id: CoinGecko ID（例如 "bitcoin"）
-      - 其他欄位不限制
-    這函式會就地加上 trend_phase/icon/note/reasons（若可）。
-    """
+def _volume_rank_flags(items: List[Dict]):
+    vols = [max(0.0, float(x.get("volume", 0))) for x in items]
+    if not vols:
+        return {}
+    s = sorted(vols)
+    def pct(v):
+        return (sum(1 for z in s if z <= v) / len(s)) if len(s) else 0.5
+    return {id(x): pct(max(0.0, float(x.get("volume", 0)))) for x in items}
+
+def annotate_with_trend(raw_strength: List[Dict], th_long: float = TH_LONG, th_short: float = TH_SHORT):
     if not ENABLE_TREND_MODEL:
-        return results
+        return raw_strength
 
-    for item in results:
-        cg_id = item.get("id") or item.get("symbol") or ""
-        if not cg_id:
+    vol_pct = _volume_rank_flags(raw_strength)
+
+    for it in raw_strength:
+        s = float(it.get("score_strong", 0.0))
+        chg = float(it.get("chg24h", 0.0))
+        vp = vol_pct.get(id(it), 0.5)
+
+        if s >= th_long and chg >= 2.0 and vp >= 0.5:
+            it["trend_phase"] = "FIRE"
+            it["trend_icon"]  = "🔥"
+            it["trend_note"]  = "主升浪：可做多，建議延長監控"
             continue
-        try:
-            bars = []
-            # 取近 6 小時、每 15 分的資料（調整看你現有 interval）
-            for b in get_recent_bars(cg_id, hours=6, interval_minutes=15):
-                bars.append(Bar(
-                    ts=b["ts"],
-                    price=b["price"],
-                    volume=b["volume"],
-                    strength=b.get("strength")  # 有就用，沒有 trend 內會用價格動能代理
-                ))
-            tr = classify(cg_id, bars)
-            item["trend_phase"] = tr.phase    # FIRE/BOLT/MOON/IDLE
-            item["trend_icon"]  = tr.icon     # 🔥⚡🌙💤
-            item["trend_note"]  = tr.note
-            item["trend_reasons"] = tr.reasons
-        except Exception as e:
-            # 保守失敗不影響主流程
-            item["trend_phase"] = "IDLE"
-            item["trend_icon"]  = "💤"
-            item["trend_note"]  = "觀望中性：資料不足或暫無方向"
-            item["trend_error"] = str(e)
 
-    return results
+        if (th_long-5) <= s < th_long and chg >= 0.8:
+            it["trend_phase"] = "BOLT"
+            it["trend_icon"]  = "⚡"
+            it["trend_note"]  = "接棒上攻：密切監控，時機可切入"
+            continue
+        if s >= th_long and 0.0 <= chg < 2.0 and vp >= 0.4:
+            it["trend_phase"] = "BOLT"
+            it["trend_icon"]  = "⚡"
+            it["trend_note"]  = "接棒上攻：動能成形中"
+            continue
+
+        if s >= (th_long-8) and (chg < 0.0 or vp < 0.35):
+            it["trend_phase"] = "MOON"
+            it["trend_icon"]  = "🌙"
+            it["trend_note"]  = "轉弱背離：別追高，考慮停利"
+            continue
+
+        it["trend_phase"] = "IDLE"
+        it["trend_icon"]  = "💤"
+        it["trend_note"]  = "觀望中性：先看戲不出手"
+
+    return raw_strength
