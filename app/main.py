@@ -196,13 +196,25 @@ def stop_task(symbol: str):
 async def today_strength(msg: str):
     rows = await fetch_crypto_markets(WATCHLIST_CRYPTOS)
     rows = score_strong(rows)
-    rows_sorted = sorted(rows, key=lambda x: x["score_strong"], reverse=True)
+
+    # 排序強弱
+    strong_sorted = sorted(rows, key=lambda x: x["score_strong"], reverse=True)
+    weak_sorted   = list(reversed(strong_sorted))
+
+    top3_strong = strong_sorted[:3]
+    top3_weak   = weak_sorted[:3]
+
     if "弱" in msg:
-        rows_sorted = list(reversed(rows_sorted))
-    top = rows_sorted[:3]
-    label = "今日強勢" if "弱" not in msg else "今日弱勢"
-    text = f"📊 {label}\n" + "\n".join([f"{i+1}. {x['symbol']} {x['score_strong']}" for i, x in enumerate(top)])
+        text = "🧊 今日弱勢\n" + "\n".join(
+            [f"{i+1}. {x['symbol']}  {x['score_strong']}" for i, x in enumerate(top3_weak)]
+        )
+    else:
+        text = "🚀 今日強勢\n" + "\n".join(
+            [f"{i+1}. {x['symbol']}  {x['score_strong']}" for i, x in enumerate(top3_strong)]
+        )
+
     push_text(text)
+
 
 def help_text() -> str:
     return ("指令例：\n"
