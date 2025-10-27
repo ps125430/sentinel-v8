@@ -14,7 +14,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 
-# Trend Integrator
+# Trend Integrator (🔥⚡🌙💤)
 from app.trend_integrator import annotate_with_trend
 
 logger = logging.getLogger("uvicorn.error")
@@ -37,7 +37,8 @@ W_NEWS   = float(os.getenv("W_NEWS", "0.40"))
 TH_LONG  = int(os.getenv("TH_LONG", "70"))
 TH_SHORT = int(os.getenv("TH_SHORT", "65"))
 
-AUTO_SUGGEST = int(os.getenv("AUTO_SUGGEST", "1"))
+AUTO_SUGGEST = int(os.getenv("AUTO_SUGGEST", "1"))        # 清單顯示 ✅ 建議
+AUTO_TREND_TUNING = int(os.getenv("AUTO_TREND_TUNING", "1"))  # 🔥自動延長 / 🌙自動停止
 
 def now_tz() -> datetime:
     return datetime.now(TZ)
@@ -157,6 +158,24 @@ def split_long_short(rows: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
     S.sort(key=lambda x: x["score_total"], reverse=True)
     return L[:5], S[:5]
 
+# ------- 自動調參（🔥自動延長、🌙自動停止） -------
+tasks: Dict[str, Dict] = {}
+def maybe_autotune_watch(rows: List[Dict]):
+    """根據趨勢自動調整現有監控：FIRE→延長、MOON→停止"""
+    if not AUTO_TREND_TUNING: 
+        return
+    for r in rows:
+        sym = (r.get("symbol") or "").upper()
+        phase = r.get("trend_phase", "")
+        if not sym or sym not in tasks:
+            continue
+        if phase == "FIRE":
+            # 若已在監控，延長 1 小時
+            create_or_extend(sym, tasks[sym]["side"], "system-auto")
+        elif phase == "MOON":
+            # 若轉弱，立即停止
+            stop_task(sym)
+
 # ------- 文案與節奏顯示 -------
 def _fmt_row_with_suggest(item: Dict, side_hint: Optional[str] = None) -> str:
     sym = item["symbol"]; score = item["score_total"]
@@ -182,7 +201,6 @@ def render_digest(phase: str, L, S, news):
     )
 
 # ------------------ 口令與監控 ------------------
-tasks = {}
 cmd_long  = re.compile(r"^\s*([A-Za-z0-9_\-./]+)\s*(做多|多|long)\s*$")
 cmd_short = re.compile(r"^\s*([A-Za-z0-9_\-./]+)\s*(做空|空|short)\s*$")
 cmd_plus  = re.compile(r"^\s*([A-Za-z0-9_\-./]+)\s*\+\s*$")
@@ -272,10 +290,12 @@ def handle_command_sync(text: str, owner: str):
 
 # ------------------ 路由 ------------------
 @app.get("/", include_in_schema=False)
-def root(): return {"status":"ok","message":"sentinel-v8 is live","time": now_tz().isoformat(timespec="seconds")}
+def root():
+    return {"status":"ok","message":"sentinel-v8 is live","time": now_tz().isoformat(timespec="seconds")}
 
 @app.get("/healthz")
-def healthz(): return {"ok": True}
+def healthz():
+    return {"ok": True}
 
 @app.get("/report")
 async def report(type: str, raw: int = 0):
@@ -286,12 +306,19 @@ async def report(type: str, raw: int = 0):
     for r in rows:
         r["score_total"] = total_score(r["score_strong"], r["score_news"])
     rows = annotate_with_trend(rows)
+    # 🔁 自動調參（若有既有監控）
+    maybe_autotune_watch(rows)
     L, S = split_long_short(rows)
     resp = {
-        "ok": True,"type": type,"generated_at": now_tz().isoformat(timespec="seconds"),
-        "watchlist": WATCHLIST_CRYPTOS,"long": L,"short": S,"top_news": []
+        "ok": True,
+        "type": type,
+        "generated_at": now_tz().isoformat(timespec="seconds"),
+        "watchlist": WATCHLIST_CRYPTOS,
+        "long": L, "short": S,
+        "top_news": []
     }
-    if raw: resp["raw_strength"] = rows
+    if raw:
+        resp["raw_strength"] = rows
     return resp
 
 @app.get("/admin/push")
@@ -301,32 +328,42 @@ async def push_alias(type: str):
     for r in rows:
         r["score_total"] = total_score(r["score_strong"], r["score_news"])
     rows = annotate_with_trend(rows)
+    # 🔁 自動調參（若有既有監控）
+    maybe_autotune_watch(rows)
     L, S = split_long_short(rows)
     text = render_digest(type, L, S, news=[])
     res = push_text(text)
     return {"ok": True, **res, "preview": text}
 
 @app.get("/admin/push-report")
-async def push_report_get(type: str): return await push_alias(type)
+async def push_report_get(type: str):
+    return await push_alias(type)
 
 @app.post("/admin/push-report")
-async def push_report_post(type: str): return await push_alias(type)
+async def push_report_post(type: str):
+    return await push_alias(type)
 
+# Webhook：含「今日強勢 / 今日弱勢」
 @app.post("/line/webhook")
 async def line_webhook(req: Request):
     body = await req.body()
-    try: data = json.loads(body.decode("utf-8"))
-    except: data = {}
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except:
+        data = {}
     try:
         events = data.get("events", [])
         for ev in events:
             src = ev.get("source", {})
             uid = src.get("userId"); gid = src.get("groupId"); rid = src.get("roomId")
-            msg = ev.get("message", {}) or {}; text = (msg.get("text") or "").strip()
+            msg = ev.get("message", {}) or {}
+            text = (msg.get("text") or "").strip()
             logger.info("[LINE] src uid=%s gid=%s rid=%s text=%s", uid, gid, rid, text)
             mode = handle_command_sync(text, owner=uid or gid or rid or "")
-            if mode == "async-needed": await today_strength(text)
-            elif mode == "help": push_text(help_text())
+            if mode == "async-needed":
+                await today_strength(text)
+            elif mode == "help":
+                push_text(help_text())
     except Exception as e:
         logger.exception("Webhook parse error: %s", e)
     return {"ok": True, "handled": True}
@@ -340,20 +377,23 @@ def schedule_tick(label: str):
             for r in rows:
                 r["score_total"] = total_score(r["score_strong"], r["score_news"])
             rows = annotate_with_trend(rows)
+            # 🔁 自動調參（若有既有監控）
+            maybe_autotune_watch(rows)
             L, S = split_long_short(rows)
             text = render_digest(label, L, S, news=[])
             push_text(text)
         except Exception as e:
             logger.exception("tick failed: %s", e)
-    import anyio; anyio.from_thread.run(anyio.run, _run)
+    import anyio
+    anyio.from_thread.run(anyio.run, _run)
 
 scheduler = BackgroundScheduler(timezone=TZ)
 
 @app.on_event("startup")
 def start_scheduler():
-    scheduler.add_job(lambda: schedule_tick("morning"), CronTrigger(hour=9,minute=30))
-    scheduler.add_job(lambda: schedule_tick("noon"), CronTrigger(hour=12,minute=30))
-    scheduler.add_job(lambda: schedule_tick("evening"), CronTrigger(hour=18,minute=0))
-    scheduler.add_job(lambda: schedule_tick("night"), CronTrigger(hour=22,minute=30))
+    scheduler.add_job(lambda: schedule_tick("morning"), CronTrigger(hour=9,  minute=30))
+    scheduler.add_job(lambda: schedule_tick("noon"),    CronTrigger(hour=12, minute=30))
+    scheduler.add_job(lambda: schedule_tick("evening"), CronTrigger(hour=18, minute=0))
+    scheduler.add_job(lambda: schedule_tick("night"),   CronTrigger(hour=22, minute=30))
     scheduler.start()
     logger.info("[scheduler] four-phase schedule registered")
