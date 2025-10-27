@@ -37,8 +37,13 @@ W_NEWS   = float(os.getenv("W_NEWS", "0.40"))
 TH_LONG  = int(os.getenv("TH_LONG", "70"))
 TH_SHORT = int(os.getenv("TH_SHORT", "65"))
 
-AUTO_SUGGEST = int(os.getenv("AUTO_SUGGEST", "1"))        # 清單顯示 ✅ 建議
-AUTO_TREND_TUNING = int(os.getenv("AUTO_TREND_TUNING", "1"))  # 🔥自動延長 / 🌙自動停止
+# 對稱決策門檻（期望值用）
+DEC_LONG  = int(os.getenv("DEC_LONG", "70"))  # >=70 且相位🔥/⚡ → 多
+DEC_SHORT = int(os.getenv("DEC_SHORT", "30"))  # <=30 且相位🌙或跌幅 → 空
+
+AUTO_SUGGEST = int(os.getenv("AUTO_SUGGEST", "1"))             # 清單顯示 ✅ 建議
+AUTO_TREND_TUNING = int(os.getenv("AUTO_TREND_TUNING", "1"))   # 🔥延長 / 🌙停止
+DEFAULT_COLOR_SCHEME = os.getenv("DEFAULT_COLOR_SCHEME", "tw").lower()  # tw(多紅/空綠) or us(多綠/空紅)
 
 def now_tz() -> datetime:
     return datetime.now(TZ)
@@ -162,7 +167,7 @@ def split_long_short(rows: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
 tasks: Dict[str, Dict] = {}
 def maybe_autotune_watch(rows: List[Dict]):
     """根據趨勢自動調整現有監控：FIRE→延長、MOON→停止"""
-    if not AUTO_TREND_TUNING: 
+    if not AUTO_TREND_TUNING:
         return
     for r in rows:
         sym = (r.get("symbol") or "").upper()
@@ -170,34 +175,106 @@ def maybe_autotune_watch(rows: List[Dict]):
         if not sym or sym not in tasks:
             continue
         if phase == "FIRE":
-            # 若已在監控，延長 1 小時
             create_or_extend(sym, tasks[sym]["side"], "system-auto")
         elif phase == "MOON":
-            # 若轉弱，立即停止
             stop_task(sym)
 
-# ------- 文案與節奏顯示 -------
-def _fmt_row_with_suggest(item: Dict, side_hint: Optional[str] = None) -> str:
-    sym = item["symbol"]; score = item["score_total"]
-    icon = item.get("trend_icon", ""); note = item.get("trend_note", "")
-    base = f"{icon} {sym}({score})".strip()
-    if AUTO_SUGGEST:
-        if score >= TH_LONG:
-            base += " ✅ 建議做多"
-        elif score >= TH_SHORT and (side_hint == "short" or side_hint is None):
-            base += " ✅ 建議做空"
-    if note:
-        base += f" — {note}"
-    return base
+# ------- Humanize + 決策層（分數→期望值/動作/理由） -------
+def expectation_from_score(total: int) -> float:
+    # [-1, +1]：+1 強多，0 中性，-1 強空
+    x = (total - 50) / 20.0
+    return max(-1.0, min(1.0, x))
 
-def render_digest(phase: str, L, S, news):
-    lt = "、".join([_fmt_row_with_suggest(x, "long") for x in L]) or "—"
-    st = "、".join([_fmt_row_with_suggest(x, "short") for x in S]) or "—"
+def decision_from_item(it: Dict) -> Dict:
+    tot = int(it.get("score_total", 0))
+    phase = it.get("trend_phase", "IDLE")
+    chg = float(it.get("chg24h", 0.0))
+    exp = expectation_from_score(tot)
+
+    if tot >= DEC_LONG and phase in {"FIRE", "BOLT"}:
+        action = "[多]"
+    elif tot <= DEC_SHORT and (phase == "MOON" or chg < 0.0):
+        action = "[空]"
+    else:
+        action = "[觀望]"
+
+    strong_i = int(it.get("score_strong", 0))
+    chg_s = f"{'+' if chg>=0 else ''}{chg:.1f}%"
+    it["expectation"] = round(exp, 2)
+    it["confidence"] = min(5, max(1, int(round(abs(exp) * 5))))
+    it["action_tag"] = action
+    it["__chg_fmt"] = chg_s
+    it["__strong_fmt"] = f"強{strong_i}"
+    return it
+
+def _median_vol(rows: List[Dict]) -> float:
+    vols = sorted([float(r.get("volume", 0.0)) for r in rows] or [1.0])
+    return vols[len(vols)//2]
+
+def enrich_readables(rows: List[Dict]) -> List[Dict]:
+    if not rows: return rows
+    med_vol = _median_vol(rows)
+    for r in rows:
+        vol = float(r.get("volume", 0.0))
+        vol_flag = "↑" if vol >= med_vol else "↓"
+        note = r.get("trend_note","")
+        r["reason_text"] = f"{r.get('__strong_fmt','強?')} / 漲{r.get('__chg_fmt','?%')} / 量{vol_flag}"
+        r["trend_action_line"] = f"{r.get('trend_icon','')} {r['symbol']}({int(r.get('score_total',0))}) {r.get('action_tag','[觀望]')} — {note} ({r['reason_text']})".strip()
+    return rows
+
+# ------- 顏色偏好：台股/美股切換（多紅/空綠 vs 多綠/空紅） -------
+color_pref: Dict[str, str] = {}  # 簡易記憶（重啟會清零）
+
+def set_color_pref(owner: str, scheme: str):
+    scheme = scheme.lower()
+    if scheme not in {"tw","us"}: return False
+    color_pref[owner] = scheme
+    return True
+
+def get_color_pref(owner: str) -> str:
+    return color_pref.get(owner, DEFAULT_COLOR_SCHEME)
+
+def color_icons(owner: str) -> Tuple[str, str]:
+    scheme = get_color_pref(owner)
+    if scheme == "us":
+        return ("🟩", "🟥")  # 美股：多綠 空紅
+    return ("🟥", "🟩")      # 台股：多紅 空綠
+
+def paint_action(owner: str, action_tag: str) -> str:
+    bull, bear = color_icons(owner)
+    if action_tag == "[多]":  return f"{bull}{action_tag}"
+    if action_tag == "[空]":  return f"{bear}{action_tag}"
+    return action_tag
+
+# ------- 文案與節奏顯示 -------
+def _fmt_row_with_suggest(item: Dict, side_hint: Optional[str] = None, owner: str = "") -> str:
+    line = item.get("trend_action_line")
+    if not line:
+        sym = item["symbol"]; score = item["score_total"]
+        icon = item.get("trend_icon", ""); note = item.get("trend_note", "")
+        base = f"{icon} {sym}({score})".strip()
+        if AUTO_SUGGEST:
+            if score >= TH_LONG:
+                base += " ✅ 建議做多"
+            elif score >= TH_SHORT and (side_hint == "short" or side_hint is None):
+                base += " ✅ 建議做空"
+        if note: base += f" — {note}"
+        line = base
+
+    at = item.get("action_tag","")
+    if at in {"[多]","[空]"}:
+        line = line.replace(at, paint_action(owner, at), 1)
+    return line
+
+def render_digest(phase: str, L, S, news, owner: str = ""):
+    lt = "、".join([_fmt_row_with_suggest(x, "long", owner) for x in L]) or "—"
+    st = "、".join([_fmt_row_with_suggest(x, "short", owner) for x in S]) or "—"
     return (
         f"【{phase}報】{now_tz().strftime('%Y-%m-%d %H:%M')}\n"
         f"🚀 做多候選：{lt}\n"
         f"🧊 做空候選：{st}\n"
-        f"(中性模式｜多≥{TH_LONG}、空≥{TH_SHORT}｜強度 {int(W_STRONG*100)}%)"
+        f"(中性模式｜多≥{TH_LONG}、空≤{DEC_SHORT}｜強度 {int(W_STRONG*100)}%)\n"
+        f"（說明：50 為中性；>= {DEC_LONG} 且相位🔥/⚡為做多；<= {DEC_SHORT} 且相位🌙或跌幅為做空；低於門檻以觀望為主）"
     )
 
 # ------------------ 口令與監控 ------------------
@@ -247,33 +324,48 @@ def stop_task(symbol: str):
     else:
         push_text(f"ℹ️ {symbol} 目前沒有進行中的監控")
 
-# ------- 強弱與節奏 -------
-async def today_strength(msg: str):
+# ------- 強弱與節奏（含人話與顏色）-------
+async def today_strength(msg: str, owner: str = ""):
     mkt = await fetch_markets(WATCHLIST_CRYPTOS)
     rows = score_strong(mkt)
     for r in rows:
         r["score_total"] = total_score(r["score_strong"], r["score_news"])
     rows = annotate_with_trend(rows)
+    rows = [decision_from_item(x) for x in rows]
+    rows = enrich_readables(rows)
+
     strong_sorted = sorted(rows, key=lambda x: x["score_strong"], reverse=True)
     weak_sorted   = list(reversed(strong_sorted))
     top3_strong, top3_weak = strong_sorted[:3], weak_sorted[:3]
     if "弱" in msg:
-        lines = [f"{i+1}. {_fmt_row_with_suggest(x,'short')}" for i,x in enumerate(top3_weak)]
+        lines = [f"{i+1}. {_fmt_row_with_suggest(x,'short',owner)}" for i,x in enumerate(top3_weak)]
         text = "🧊 今日弱勢\n" + "\n".join(lines)
     else:
-        lines = [f"{i+1}. {_fmt_row_with_suggest(x,'long')}" for i,x in enumerate(top3_strong)]
+        lines = [f"{i+1}. {_fmt_row_with_suggest(x,'long',owner)}" for i,x in enumerate(top3_strong)]
         text = "🚀 今日強勢\n" + "\n".join(lines)
-    push_text(text if text.strip() else "（目前資料暫無，稍後再試）")
+    push_text(text if text.strip() else "（目前資料暫無，稍後再試）", to=owner or None)
 
 def help_text() -> str:
     return ("指令例：\n"
             "BTC 做多｜ETH 做空｜BTC +（延長1小時）｜ETH -（停止）｜總覽\n"
-            "今日強勢｜今日弱勢")
+            "今日強勢｜今日弱勢\n"
+            "顏色 台股（多=紅、空=綠）｜顏色 美股（多=綠、空=紅）")
 
 def handle_command_sync(text: str, owner: str):
     t = text.strip()
+
+    # 顏色切換
+    if t in {"顏色 台股","顏色台股","color tw","顏色 TW","顏色 tw"}:
+        if set_color_pref(owner, "tw"):
+            push_text("🎨 已切換顏色為：台股（多=紅、空=綠）", to=owner or None)
+        return "ok"
+    if t in {"顏色 美股","顏色美股","color us","顏色 US","顏色 us"}:
+        if set_color_pref(owner, "us"):
+            push_text("🎨 已切換顏色為：美股（多=綠、空=紅）", to=owner or None)
+        return "ok"
+
     if t in {"總覽","狀態","status"}:
-        push_text(f"📋 監控：{status_list()}"); return "ok"
+        push_text(f"📋 監控：{status_list()}", to=owner or None); return "ok"
     m = cmd_long.match(t)
     if m: create_or_extend(m.group(1).upper(),"做多",owner); return "ok"
     m = cmd_short.match(t)
@@ -282,7 +374,7 @@ def handle_command_sync(text: str, owner: str):
     if m:
         sym = m.group(1).upper()
         if sym in tasks: create_or_extend(sym,tasks[sym]["side"],owner)
-        else: push_text(f"ℹ️ {sym} 尚未建立監控，可用『{sym} 做多』或『{sym} 做空』")
+        else: push_text(f"ℹ️ {sym} 尚未建立監控，可用『{sym} 做多』或『{sym} 做空』", to=owner or None)
         return "ok"
     m = cmd_stop.match(t)
     if m: stop_task(m.group(1).upper()); return "ok"
@@ -306,6 +398,8 @@ async def report(type: str, raw: int = 0):
     for r in rows:
         r["score_total"] = total_score(r["score_strong"], r["score_news"])
     rows = annotate_with_trend(rows)
+    rows = [decision_from_item(x) for x in rows]
+    rows = enrich_readables(rows)
     # 🔁 自動調參（若有既有監控）
     maybe_autotune_watch(rows)
     L, S = split_long_short(rows)
@@ -328,10 +422,11 @@ async def push_alias(type: str):
     for r in rows:
         r["score_total"] = total_score(r["score_strong"], r["score_news"])
     rows = annotate_with_trend(rows)
-    # 🔁 自動調參（若有既有監控）
+    rows = [decision_from_item(x) for x in rows]
+    rows = enrich_readables(rows)
     maybe_autotune_watch(rows)
     L, S = split_long_short(rows)
-    text = render_digest(type, L, S, news=[])
+    text = render_digest(type, L, S, news=[], owner=LINE_DEFAULT_TO)
     res = push_text(text)
     return {"ok": True, **res, "preview": text}
 
@@ -356,14 +451,15 @@ async def line_webhook(req: Request):
         for ev in events:
             src = ev.get("source", {})
             uid = src.get("userId"); gid = src.get("groupId"); rid = src.get("roomId")
+            owner = uid or gid or rid or ""
             msg = ev.get("message", {}) or {}
             text = (msg.get("text") or "").strip()
             logger.info("[LINE] src uid=%s gid=%s rid=%s text=%s", uid, gid, rid, text)
-            mode = handle_command_sync(text, owner=uid or gid or rid or "")
+            mode = handle_command_sync(text, owner=owner)
             if mode == "async-needed":
-                await today_strength(text)
+                await today_strength(text, owner=owner)
             elif mode == "help":
-                push_text(help_text())
+                push_text(help_text(), to=owner or None)
     except Exception as e:
         logger.exception("Webhook parse error: %s", e)
     return {"ok": True, "handled": True}
@@ -377,11 +473,12 @@ def schedule_tick(label: str):
             for r in rows:
                 r["score_total"] = total_score(r["score_strong"], r["score_news"])
             rows = annotate_with_trend(rows)
-            # 🔁 自動調參（若有既有監控）
+            rows = [decision_from_item(x) for x in rows]
+            rows = enrich_readables(rows)
             maybe_autotune_watch(rows)
             L, S = split_long_short(rows)
-            text = render_digest(label, L, S, news=[])
-            push_text(text)
+            text = render_digest(label, L, S, news=[], owner=LINE_DEFAULT_TO)
+            push_text(text, to=LINE_DEFAULT_TO or None)
         except Exception as e:
             logger.exception("tick failed: %s", e)
     import anyio
