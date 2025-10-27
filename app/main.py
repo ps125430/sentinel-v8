@@ -14,6 +14,9 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 
+# Trend Integrator
+from app.trend_integrator import annotate_with_trend
+
 logger = logging.getLogger("uvicorn.error")
 TZ = ZoneInfo("Asia/Taipei")
 
@@ -24,20 +27,17 @@ LINE_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_DEFAULT_TO = os.getenv("LINE_DEFAULT_TO", "")
 line_api = LineBotApi(LINE_TOKEN) if LINE_TOKEN else None
 
-# 觀察名單（CoinGecko 的 id）
 WATCHLIST_CRYPTOS = [s.strip() for s in os.getenv(
     "WATCHLIST_CRYPTOS",
     "bitcoin,ethereum,solana,dogecoin,cardano,ripple,chainlink,wrapped-bitcoin,polkadot,matic-network,avalanche-2,uniswap"
 ).split(",") if s.strip()]
 
-# 分數權重與門檻（中性）
 W_STRONG = float(os.getenv("W_STRONG", "0.60"))
 W_NEWS   = float(os.getenv("W_NEWS", "0.40"))
-TH_LONG  = int(os.getenv("TH_LONG", "70"))  # 做多門檻
-TH_SHORT = int(os.getenv("TH_SHORT", "65"))  # 做空門檻
+TH_LONG  = int(os.getenv("TH_LONG", "70"))
+TH_SHORT = int(os.getenv("TH_SHORT", "65"))
 
-# 是否在強弱清單中加入「建議」標示（✅）
-AUTO_SUGGEST = int(os.getenv("AUTO_SUGGEST", "1"))  # 1 開啟（預設），0 關閉
+AUTO_SUGGEST = int(os.getenv("AUTO_SUGGEST", "1"))
 
 def now_tz() -> datetime:
     return datetime.now(TZ)
@@ -55,21 +55,13 @@ def push_text(text: str, to: str | None = None) -> Dict:
         logger.exception("LINE push failed: %s", e)
         return {"sent": False, "error": str(e)}
 
-# ------------------ 市場數據：CoinGecko → Binance 容錯 ------------------
+# ------------------ 市場數據：CoinGecko → Binance ------------------
 CG_BASE = "https://api.coingecko.com/api/v3"
 BINANCE_MAP = {
-    "bitcoin": "BTCUSDT",
-    "ethereum": "ETHUSDT",
-    "solana": "SOLUSDT",
-    "dogecoin": "DOGEUSDT",
-    "cardano": "ADAUSDT",
-    "ripple": "XRPUSDT",
-    "chainlink": "LINKUSDT",
-    "avalanche-2": "AVAXUSDT",
-    "polkadot": "DOTUSDT",
-    "matic-network": "MATICUSDT",
-    "uniswap": "UNIUSDT",
-    "wrapped-bitcoin": "BTCUSDT",
+    "bitcoin": "BTCUSDT","ethereum": "ETHUSDT","solana": "SOLUSDT",
+    "dogecoin": "DOGEUSDT","cardano": "ADAUSDT","ripple": "XRPUSDT",
+    "chainlink": "LINKUSDT","avalanche-2": "AVAXUSDT","polkadot": "DOTUSDT",
+    "matic-network": "MATICUSDT","uniswap": "UNIUSDT","wrapped-bitcoin": "BTCUSDT"
 }
 
 async def fetch_coingecko_markets(ids: List[str]) -> List[Dict]:
@@ -111,12 +103,9 @@ async def fetch_binance_markets(ids: List[str]) -> List[Dict]:
                 vol = float(j.get("quoteVolume", 0.0))
                 cid = next((k for k, v in BINANCE_MAP.items() if v == sym), sym.lower())
                 rows.append({
-                    "id": cid,
-                    "symbol": sym.replace("USDT", ""),
-                    "name": cid,
-                    "current_price": price,
-                    "price_change_percentage_24h": chg_pct,
-                    "total_volume": vol,
+                    "id": cid,"symbol": sym.replace("USDT", ""),
+                    "name": cid,"current_price": price,
+                    "price_change_percentage_24h": chg_pct,"total_volume": vol,
                 })
         return rows
     except Exception as e:
@@ -138,7 +127,6 @@ def score_strong(rows: List[Dict]) -> List[Dict]:
     vol_vals = [float(row.get("total_volume") or 0.0) for row in rows]
     lo_chg, hi_chg = min(chg_vals), max(chg_vals)
     lo_vol, hi_vol = min(vol_vals), max(vol_vals)
-
     out = []
     for row in rows:
         sym = (row.get("symbol") or "").upper()
@@ -150,14 +138,8 @@ def score_strong(rows: List[Dict]) -> List[Dict]:
         s_vol = normalize(math.log1p(vol), math.log1p(lo_vol), math.log1p(hi_vol))
         s = (s_chg * 0.6 + s_vol * 0.4) * 100
         out.append({
-            "id": row.get("id"),
-            "symbol": sym,
-            "name": name,
-            "price": price,
-            "chg24h": chg,
-            "volume": vol,
-            "score_strong": round(s, 1),
-            "score_news": 0.0,
+            "id": row.get("id"),"symbol": sym,"name": name,"price": price,
+            "chg24h": chg,"volume": vol,"score_strong": round(s, 1),"score_news": 0.0
         })
     return out
 
@@ -175,16 +157,19 @@ def split_long_short(rows: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
     S.sort(key=lambda x: x["score_total"], reverse=True)
     return L[:5], S[:5]
 
-# ------- 文案（A：行情氣氛派）＋建議標示 -------
+# ------- 文案與節奏顯示 -------
 def _fmt_row_with_suggest(item: Dict, side_hint: Optional[str] = None) -> str:
-    sym = item["symbol"]
-    score = item["score_total"]
+    sym = item["symbol"]; score = item["score_total"]
+    icon = item.get("trend_icon", ""); note = item.get("trend_note", "")
+    base = f"{icon} {sym}({score})".strip()
     if AUTO_SUGGEST:
         if score >= TH_LONG:
-            return f"{sym}({score}) ✅ 建議做多"
-        if score >= TH_SHORT and (side_hint == "short" or side_hint is None):
-            return f"{sym}({score}) ✅ 建議做空"
-    return f"{sym}({score})"
+            base += " ✅ 建議做多"
+        elif score >= TH_SHORT and (side_hint == "short" or side_hint is None):
+            base += " ✅ 建議做空"
+    if note:
+        base += f" — {note}"
+    return base
 
 def render_digest(phase: str, L, S, news):
     lt = "、".join([_fmt_row_with_suggest(x, "long") for x in L]) or "—"
@@ -196,7 +181,7 @@ def render_digest(phase: str, L, S, news):
         f"(中性模式｜多≥{TH_LONG}、空≥{TH_SHORT}｜強度 {int(W_STRONG*100)}%)"
     )
 
-# ------------------ 口令＋監控 ------------------
+# ------------------ 口令與監控 ------------------
 tasks = {}
 cmd_long  = re.compile(r"^\s*([A-Za-z0-9_\-./]+)\s*(做多|多|long)\s*$")
 cmd_short = re.compile(r"^\s*([A-Za-z0-9_\-./]+)\s*(做空|空|short)\s*$")
@@ -204,8 +189,7 @@ cmd_plus  = re.compile(r"^\s*([A-Za-z0-9_\-./]+)\s*\+\s*$")
 cmd_stop  = re.compile(r"^\s*([A-Za-z0-9_\-./]+)\s*-\s*$")
 
 def status_list():
-    now = now_tz()
-    items = []
+    now = now_tz(); items = []
     for s, v in tasks.items():
         left = int((v["until"] - now).total_seconds() // 60)
         items.append(f"{s} {v['side']}（剩 {max(left,0)} 分）")
@@ -219,11 +203,10 @@ def schedule_end(symbol: str):
     until: datetime = job["until"]
     remind_at = until - timedelta(minutes=5)
     if remind_at > now_tz():
-        scheduler.add_job(lambda s=symbol: push_text(f"⏰ {s} 任務將在 5 分鐘後到期"), DateTrigger(run_date=remind_at))
+        scheduler.add_job(lambda s=symbol: push_text(f"⏰ {s} 任務將在5分鐘後到期"), DateTrigger(run_date=remind_at))
     def _expire(s=symbol):
         if s in tasks:
-            side = tasks[s]["side"]
-            tasks.pop(s, None)
+            side = tasks[s]["side"]; tasks.pop(s, None)
             push_text(f"✅ {s} {side} 監控已到期並結束")
     scheduler.add_job(_expire, DateTrigger(run_date=until))
 
@@ -236,36 +219,32 @@ def create_or_extend(symbol: str, side: str, owner: str):
     else:
         until = n + timedelta(hours=1)
         tasks[symbol] = {"side": side, "until": until, "owner": owner}
-        push_text(f"🟢 已建立 {symbol} {side} 監控，至 {until.strftime('%H:%M')}（到期前 5 分鐘提醒）")
+        push_text(f"🟢 已建立 {symbol} {side} 監控，至 {until.strftime('%H:%M')}（到期前5分鐘提醒）")
     schedule_end(symbol)
 
 def stop_task(symbol: str):
     if symbol in tasks:
-        side = tasks[symbol]["side"]
-        tasks.pop(symbol, None)
+        side = tasks[symbol]["side"]; tasks.pop(symbol, None)
         push_text(f"🛑 已停止 {symbol} {side} 監控")
     else:
         push_text(f"ℹ️ {symbol} 目前沒有進行中的監控")
 
-# ------- 「今日強勢 / 今日弱勢」：加上建議標示 -------
+# ------- 強弱與節奏 -------
 async def today_strength(msg: str):
     mkt = await fetch_markets(WATCHLIST_CRYPTOS)
     rows = score_strong(mkt)
-    # 補總分用於判斷
     for r in rows:
         r["score_total"] = total_score(r["score_strong"], r["score_news"])
+    rows = annotate_with_trend(rows)
     strong_sorted = sorted(rows, key=lambda x: x["score_strong"], reverse=True)
     weak_sorted   = list(reversed(strong_sorted))
-    top3_strong = strong_sorted[:3]
-    top3_weak   = weak_sorted[:3]
-
+    top3_strong, top3_weak = strong_sorted[:3], weak_sorted[:3]
     if "弱" in msg:
-        lines = [f"{i+1}. {_fmt_row_with_suggest(x, 'short')}" for i, x in enumerate(top3_weak)]
+        lines = [f"{i+1}. {_fmt_row_with_suggest(x,'short')}" for i,x in enumerate(top3_weak)]
         text = "🧊 今日弱勢\n" + "\n".join(lines)
     else:
-        lines = [f"{i+1}. {_fmt_row_with_suggest(x, 'long')}" for i, x in enumerate(top3_strong)]
+        lines = [f"{i+1}. {_fmt_row_with_suggest(x,'long')}" for i,x in enumerate(top3_strong)]
         text = "🚀 今日強勢\n" + "\n".join(lines)
-
     push_text(text if text.strip() else "（目前資料暫無，稍後再試）")
 
 def help_text() -> str:
@@ -278,13 +257,13 @@ def handle_command_sync(text: str, owner: str):
     if t in {"總覽","狀態","status"}:
         push_text(f"📋 監控：{status_list()}"); return "ok"
     m = cmd_long.match(t)
-    if m: create_or_extend(m.group(1).upper(), "做多", owner); return "ok"
+    if m: create_or_extend(m.group(1).upper(),"做多",owner); return "ok"
     m = cmd_short.match(t)
-    if m: create_or_extend(m.group(1).upper(), "做空", owner); return "ok"
+    if m: create_or_extend(m.group(1).upper(),"做空",owner); return "ok"
     m = cmd_plus.match(t)
     if m:
         sym = m.group(1).upper()
-        if sym in tasks: create_or_extend(sym, tasks[sym]["side"], owner)
+        if sym in tasks: create_or_extend(sym,tasks[sym]["side"],owner)
         else: push_text(f"ℹ️ {sym} 尚未建立監控，可用『{sym} 做多』或『{sym} 做空』")
         return "ok"
     m = cmd_stop.match(t)
@@ -293,12 +272,10 @@ def handle_command_sync(text: str, owner: str):
 
 # ------------------ 路由 ------------------
 @app.get("/", include_in_schema=False)
-def root():
-    return {"status":"ok","message":"sentinel-v8 is live","time": now_tz().isoformat(timespec="seconds")}
+def root(): return {"status":"ok","message":"sentinel-v8 is live","time": now_tz().isoformat(timespec="seconds")}
 
 @app.get("/healthz")
-def healthz():
-    return {"ok": True}
+def healthz(): return {"ok": True}
 
 @app.get("/report")
 async def report(type: str, raw: int = 0):
@@ -306,20 +283,15 @@ async def report(type: str, raw: int = 0):
         return {"ok": False, "error": "invalid type"}
     mkt = await fetch_markets(WATCHLIST_CRYPTOS)
     rows = score_strong(mkt)
-    # 加總分
     for r in rows:
         r["score_total"] = total_score(r["score_strong"], r["score_news"])
+    rows = annotate_with_trend(rows)
     L, S = split_long_short(rows)
     resp = {
-        "ok": True,
-        "type": type,
-        "generated_at": now_tz().isoformat(timespec="seconds"),
-        "watchlist": WATCHLIST_CRYPTOS,
-        "long": L, "short": S,
-        "top_news": []
+        "ok": True,"type": type,"generated_at": now_tz().isoformat(timespec="seconds"),
+        "watchlist": WATCHLIST_CRYPTOS,"long": L,"short": S,"top_news": []
     }
-    if raw:
-        resp["raw_strength"] = rows
+    if raw: resp["raw_strength"] = rows
     return resp
 
 @app.get("/admin/push")
@@ -328,45 +300,38 @@ async def push_alias(type: str):
     rows = score_strong(mkt)
     for r in rows:
         r["score_total"] = total_score(r["score_strong"], r["score_news"])
+    rows = annotate_with_trend(rows)
     L, S = split_long_short(rows)
     text = render_digest(type, L, S, news=[])
     res = push_text(text)
     return {"ok": True, **res, "preview": text}
 
 @app.get("/admin/push-report")
-async def push_report_get(type: str):
-    return await push_alias(type)
+async def push_report_get(type: str): return await push_alias(type)
 
 @app.post("/admin/push-report")
-async def push_report_post(type: str):
-    return await push_alias(type)
+async def push_report_post(type: str): return await push_alias(type)
 
-# Webhook：含「今日強勢 / 今日弱勢」
 @app.post("/line/webhook")
 async def line_webhook(req: Request):
     body = await req.body()
-    try:
-        data = json.loads(body.decode("utf-8"))
-    except:
-        data = {}
+    try: data = json.loads(body.decode("utf-8"))
+    except: data = {}
     try:
         events = data.get("events", [])
         for ev in events:
             src = ev.get("source", {})
             uid = src.get("userId"); gid = src.get("groupId"); rid = src.get("roomId")
-            msg = ev.get("message", {}) or {}
-            text = (msg.get("text") or "").strip()
+            msg = ev.get("message", {}) or {}; text = (msg.get("text") or "").strip()
             logger.info("[LINE] src uid=%s gid=%s rid=%s text=%s", uid, gid, rid, text)
             mode = handle_command_sync(text, owner=uid or gid or rid or "")
-            if mode == "async-needed":
-                await today_strength(text)
-            elif mode == "help":
-                push_text(help_text())
+            if mode == "async-needed": await today_strength(text)
+            elif mode == "help": push_text(help_text())
     except Exception as e:
         logger.exception("Webhook parse error: %s", e)
     return {"ok": True, "handled": True}
 
-# 自動推播排程
+# ------------------ 四時段排程 ------------------
 def schedule_tick(label: str):
     async def _run():
         try:
@@ -374,21 +339,16 @@ def schedule_tick(label: str):
             rows = score_strong(mkt)
             for r in rows:
                 r["score_total"] = total_score(r["score_strong"], r["score_news"])
+            rows = annotate_with_trend(rows)
             L, S = split_long_short(rows)
             text = render_digest(label, L, S, news=[])
             push_text(text)
         except Exception as e:
             logger.exception("tick failed: %s", e)
-    import anyio
-    anyio.from_thread.run(anyio.run, _run)
+    import anyio; anyio.from_thread.run(anyio.run, _run)
 
 scheduler = BackgroundScheduler(timezone=TZ)
 
 @app.on_event("startup")
 def start_scheduler():
-    scheduler.add_job(lambda: schedule_tick("morning"), CronTrigger(hour=9,  minute=30))
-    scheduler.add_job(lambda: schedule_tick("noon"),    CronTrigger(hour=12, minute=30))
-    scheduler.add_job(lambda: schedule_tick("evening"), CronTrigger(hour=18, minute=0))
-    scheduler.add_job(lambda: schedule_tick("night"),   CronTrigger(hour=22, minute=30))
-    scheduler.start()
-    logger.info("[scheduler] four-phase schedule registered")
+    scheduler.add_job(lambda: schedule_tick("morning"), CronTrigger(hour
