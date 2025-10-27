@@ -53,19 +53,35 @@ def report(type: str):
 
 
 # ---------------------------
-#   手動推播（可先測試是否打得出去）
+#   推播（GET & POST 都可；另開 GET 別名 /admin/push）
 # ---------------------------
-@app.post("/admin/push-report")
-async def push_report(type: str):
-    text = f"【{type}報】sentinel-v8 {datetime.now(TZ).strftime('%Y-%m-%d %H:%M')}"
+def _push_text(text: str):
     if line_api and LINE_DEFAULT_TO:
         try:
             line_api.push_message(LINE_DEFAULT_TO, TextSendMessage(text=text))
-            return {"ok": True, "sent": True, "to": LINE_DEFAULT_TO}
+            return {"sent": True, "to": LINE_DEFAULT_TO}
         except Exception as e:
             logger.exception("LINE push failed: %s", e)
-            return {"ok": True, "sent": False, "error": str(e)}
-    return {"ok": True, "sent": False, "reason": "LINE not configured"}
+            return {"sent": False, "error": str(e)}
+    return {"sent": False, "reason": "LINE not configured"}
+
+@app.get("/admin/push")
+async def push_alias(type: str):
+    text = f"【{type}報】sentinel-v8 {datetime.now(TZ).strftime('%Y-%m-%d %H:%M')}"
+    res = _push_text(text)
+    return {"ok": True, **res, "preview": text}
+
+@app.get("/admin/push-report")
+async def push_report_get(type: str):
+    text = f"【{type}報】sentinel-v8 {datetime.now(TZ).strftime('%Y-%m-%d %H:%M')}"
+    res = _push_text(text)
+    return {"ok": True, **res, "preview": text}
+
+@app.post("/admin/push-report")
+async def push_report_post(type: str):
+    text = f"【{type}報】sentinel-v8 {datetime.now(TZ).strftime('%Y-%m-%d %H:%M')}"
+    res = _push_text(text)
+    return {"ok": True, **res, "preview": text}
 
 
 # ---------------------------
