@@ -351,4 +351,9 @@ scheduler = BackgroundScheduler(timezone=TZ)
 
 @app.on_event("startup")
 def start_scheduler():
-    scheduler.add_job(lambda: schedule_tick("morning"), CronTrigger(hour
+    scheduler.add_job(lambda: schedule_tick("morning"), CronTrigger(hour=9,minute=30))
+    scheduler.add_job(lambda: schedule_tick("noon"), CronTrigger(hour=12,minute=30))
+    scheduler.add_job(lambda: schedule_tick("evening"), CronTrigger(hour=18,minute=0))
+    scheduler.add_job(lambda: schedule_tick("night"), CronTrigger(hour=22,minute=30))
+    scheduler.start()
+    logger.info("[scheduler] four-phase schedule registered")
