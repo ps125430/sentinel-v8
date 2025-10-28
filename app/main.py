@@ -1,28 +1,140 @@
 # =========================
-# app/main.py 〔覆蓋版・一鍵貼上 R2b〕
-# Sentinel v8 · FastAPI + APScheduler + LINE Reply + 版本核對/徽章 + debug endpoints
-# ＊所有回覆加「【v8R2】」指紋；已掛載 /admin/ping-services 與 /admin/env-lite
+# app/main.py 〔覆蓋版・一鍵貼上 R4〕
+# Sentinel v8 · FastAPI + APScheduler + LINE Reply
+# 內建：/admin/env-lite、/admin/ping-services、/admin/version-snapshot|diff|badge
+# 內建：version_diff 後備實作（即使沒有 app/services/version_diff.py 也能跑）
+# ＊所有回覆加「【v8R4】」指紋；logs 帶 [WH][v8R4]/[PUSH][v8R4]
 # =========================
 
 from __future__ import annotations
-import os, re, time, json
+import os, re, time, json, hashlib
 from zoneinfo import ZoneInfo
+from typing import Dict, Any, Tuple
 from fastapi import FastAPI, Request
 from apscheduler.schedulers.background import BackgroundScheduler
 
+# --- 既有模組 ---
 from app.state_store import get_state, save_state, set_watch, cleanup_expired, list_watches
 from app.services.prefs import resolve_scheme, set_color_scheme, current_scheme
 from app.services import watches as W
 from app import trend_integrator, news_scoring
 from app import us_stocks, us_news
 from app import badges_radar
-from app.services import version_diff
-from app import admin_version
-from app import admin_ping  # ★ 新增：自檢路由
 
+# ============ version_diff：優先載入正式版，失敗時使用內建後備 ============
+BASELINE_PATH = "/tmp/sentinel-v8.version-prev.json"
+SCAN_ROOT = "."
+
+def _iter_files(root: str):
+    skip_dirs = {".git", "__pycache__", ".venv", "venv", ".render"}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dn = os.path.basename(dirpath)
+        if dn in skip_dirs or "/.venv/" in dirpath or "/venv/" in dirpath:
+            continue
+        for fn in filenames:
+            # 只掃描專案檔（略過超大或 cache 類型）
+            if fn.endswith((".py", ".json", ".txt", ".md", ".yaml", ".yml")) or "." in fn:
+                p = os.path.join(dirpath, fn)
+                # 限制：最多 256 KB 避免 I/O 爆
+                try:
+                    size = os.path.getsize(p)
+                    if size > 262_144:
+                        continue
+                except Exception:
+                    continue
+                yield p
+
+def _fingerprint(path: str) -> Tuple[int, int, str]:
+    """return (size, mtime, sha1[:8])"""
+    try:
+        st = os.stat(path)
+        size, mtime = int(st.st_size), int(st.st_mtime)
+        h = hashlib.sha1()
+        with open(path, "rb") as f:
+            h.update(f.read())
+        return size, mtime, h.hexdigest()[:8]
+    except Exception:
+        return 0, 0, ""
+
+def _snapshot(root: str) -> Dict[str, Any]:
+    items = {}
+    root = os.path.abspath(root)
+    for p in _iter_files(root):
+        rp = os.path.relpath(p, root)
+        size, mtime, sh = _fingerprint(p)
+        if sh:
+            items[rp] = {"size": size, "mtime": mtime, "sha": sh}
+    return {"root": root, "ts": int(time.time()), "items": items}
+
+def _diff(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+    A, B = a.get("items", {}), b.get("items", {})
+    add, delete, modify = [], [], []
+    for k in B:
+        if k not in A:
+            add.append(k)
+        else:
+            if A[k].get("sha") != B[k].get("sha"):
+                modify.append(k)
+    for k in A:
+        if k not in B:
+            delete.append(k)
+    return {"add": sorted(add), "delete": sorted(delete), "modify": sorted(modify)}
+
+def _mk_summary(delta: Dict[str, Any], limit: int = 10) -> str:
+    a, d, m = len(delta["add"]), len(delta["delete"]), len(delta["modify"])
+    lines = [f"📦 版本差異：+{a} −{d} ✎{m}（顯示最多 {limit} 筆）"]
+    def cut(lst, mark):
+        for i, k in enumerate(lst[:limit], 1):
+            lines.append(f"{mark} {i}. {k}")
+    cut(delta["add"], "+")
+    cut(delta["modify"], "✎")
+    cut(delta["delete"], "−")
+    return "\n".join(lines)
+
+class _VersionDiffFallback:
+    @staticmethod
+    def checkpoint_now(root: str = SCAN_ROOT) -> Dict[str, Any]:
+        snap = _snapshot(root)
+        with open(BASELINE_PATH, "w", encoding="utf-8") as f:
+            json.dump(snap, f, ensure_ascii=False)
+        return {"ok": True, "count": len(snap["items"])}
+
+    @staticmethod
+    def diff_now_vs_prev(root: str = SCAN_ROOT) -> Dict[str, Any]:
+        now = _snapshot(root)
+        try:
+            with open(BASELINE_PATH, "r", encoding="utf-8") as f:
+                prev = json.load(f)
+        except Exception:
+            prev = {"items": {}}
+        delta = _diff(prev, now)
+        return {"delta": delta, "summary": _mk_summary(delta), "now_count": len(now["items"])}
+
+    @staticmethod
+    def get_version_badge() -> Tuple[bool, str]:
+        try:
+            with open(BASELINE_PATH, "r", encoding="utf-8") as f:
+                prev = json.load(f)
+        except Exception:
+            prev = {"items": {}}
+        now = _snapshot(SCAN_ROOT)
+        d = _diff(prev, now)
+        n = len(d["add"]) + len(d["delete"]) + len(d["modify"])
+        return (n > 0, f"版本Δ({n})") if n > 0 else (False, "")
+
+# 嘗試載入正式版；失敗就用 fallback
+try:
+    from app.services import version_diff as version_diff  # type: ignore
+    if version_diff is None:  # 由 __init__.py 給的 None
+        raise ImportError("version_diff None")
+except Exception:
+    version_diff = _VersionDiffFallback()  # type: ignore
+
+# ============ LINE SDK ============
 from linebot import LineBotApi
 from linebot.models import TextSendMessage
 
+# ========= 基本設定 =========
 TZ = ZoneInfo("Asia/Taipei")
 app = FastAPI(title="sentinel-v8")
 
@@ -30,53 +142,102 @@ LINE_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_PUSH_TO = os.getenv("LINE_PUSH_TO", "")
 line_bot_api = LineBotApi(LINE_ACCESS_TOKEN) if LINE_ACCESS_TOKEN else None
 
-# 掛載管理路由（版本 & 自檢）
-app.include_router(admin_version.router)
-app.include_router(admin_ping.router)
-
+# ========= 啟動流程 =========
 @app.on_event("startup")
 def on_startup():
-    print("[BOOT][v8R2] starting…")
+    print("[BOOT][v8R4] starting…")
     _ = get_state(); save_state()
     try:
         badges_radar.refresh_badges()
-        print("[BOOT][v8R2] badges refreshed")
+        print("[BOOT][v8R4] badges refreshed")
     except Exception as e:
-        print("[BOOT][v8R2] badges init err:", e)
+        print("[BOOT][v8R4] badges init err:", e)
+    # 初始化版本基準（若不存在）
     try:
-        if not os.path.exists("/tmp/sentinel-v8.version-prev.json"):
+        if not os.path.exists(BASELINE_PATH):
             version_diff.checkpoint_now(".")
-            print("[BOOT][v8R2] version baseline created")
+            print("[BOOT][v8R4] version baseline created")
     except Exception as e:
-        print("[BOOT][v8R2] version baseline err:", e)
+        print("[BOOT][v8R4] version baseline err:", e)
 
+# ========= 健康檢查 / 診斷 =========
 @app.get("/")
 def root():
-    return {"ok": True, "tag": "v8R2", "ts": int(time.time())}
+    return {"ok": True, "tag": "v8R4", "ts": int(time.time())}
 
 @app.get("/admin/env-lite")
 def env_lite():
     return {
-        "tag": "v8R2",
+        "tag": "v8R4",
         "has_line_token": bool(LINE_ACCESS_TOKEN),
         "has_push_target": bool(LINE_PUSH_TO),
     }
 
+@app.get("/admin/ping-services")
+def ping_services():
+    def check(modname):
+        try:
+            __import__(modname)
+            return True, ""
+        except Exception as e:
+            return False, str(e)
+    ok_prefs, err_prefs = check("app.services.prefs")
+    ok_watches, err_watches = check("app.services.watches")
+    # version_diff 可選
+    try:
+        from app.services import version_diff as _vd  # type: ignore
+        ok_vd = _vd is not None
+        err_vd = "" if ok_vd else "module not present (optional)"
+    except Exception as e:
+        ok_vd, err_vd = False, str(e)
+    return {"ok": {"prefs": ok_prefs, "watches": ok_watches, "version_diff": ok_vd},
+            "errors": {"prefs": err_prefs, "watches": err_watches, "version_diff": err_vd}}
+
+# ========= 版本 API（內建）=========
+@app.post("/admin/version-snapshot")
+def admin_version_snapshot():
+    try:
+        res = version_diff.checkpoint_now(".")
+        return {"ok": True, "res": res}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.get("/admin/version-diff")
+def admin_version_diff(save: int = 0):
+    try:
+        res = version_diff.diff_now_vs_prev(".")
+        if save:
+            version_diff.checkpoint_now(".")
+            res["saved"] = True
+        return res
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.get("/admin/version-badge")
+def admin_version_badge():
+    try:
+        has, badge = version_diff.get_version_badge()
+        return {"has_delta": has, "badge": badge}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+# ========= LINE 推播（排程用）=========
 def push_to_line(text: str):
-    msg = f"【v8R2】{text}"
+    msg = f"【v8R4】{text}"
     if line_bot_api and LINE_PUSH_TO:
         try:
             line_bot_api.push_message(LINE_PUSH_TO, TextSendMessage(msg))
-            print("[PUSH][v8R2] sent to LINE_PUSH_TO")
+            print("[PUSH][v8R4] sent to LINE_PUSH_TO")
             return
         except Exception as e:
-            print(f"[PUSH][v8R2] error:", e)
-    print("[PUSH][v8R2] console:", msg)
+            print(f"[PUSH][v8R4] error:", e)
+    print("[PUSH][v8R4] console:", msg)
 
+# ========= LINE Webhook（回覆＋強 log）=========
 @app.post("/line/webhook")
 async def line_webhook(request: Request):
     payload = await request.json()
-    print("[WH][v8R2] inbound:", json.dumps(payload, ensure_ascii=False)[:400])
+    print("[WH][v8R4] inbound:", json.dumps(payload, ensure_ascii=False)[:400])
     events = payload.get("events", [])
     out = []
 
@@ -84,17 +245,17 @@ async def line_webhook(request: Request):
         raw = (ev.get("message", {}) or {}).get("text", "") or ""
         reply_token = ev.get("replyToken")
         t = re.sub(r"\s+", " ", raw.replace("\u3000", " ")).strip()
-        print(f"[WH][v8R2] text='{t}' reply_token={'Y' if reply_token else 'N'}")
+        print(f"[WH][v8R4] text='{t}' reply_token={'Y' if reply_token else 'N'}")
 
         def reply(msg: str):
-            tagged = f"【v8R2】{msg}"
+            tagged = f"【v8R4】{msg}"
             out.append(tagged)
             if line_bot_api and reply_token:
                 try:
                     line_bot_api.reply_message(reply_token, TextSendMessage(tagged))
-                    print("[WH][v8R2] replied via Reply API")
+                    print("[WH][v8R4] replied via Reply API")
                 except Exception as e:
-                    print("[WH][v8R2] reply error:", e)
+                    print("[WH][v8R4] reply error:", e)
 
         # 版本核對 / 差異（最優先，含別名）
         if t in ("版本核對", "版本差異", "版本差异", "version diff", "version-diff", "ver diff"):
@@ -183,6 +344,7 @@ async def line_webhook(request: Request):
 
     return {"messages": out}
 
+# ========= 報表（四時段）=========
 def compose_report(phase: str) -> str:
     scheme = current_scheme()
 
@@ -219,6 +381,7 @@ def compose_report(phase: str) -> str:
     parts.append(ti)
     return "\n".join(parts)
 
+# ========= 排程 =========
 sched = BackgroundScheduler(timezone=str(TZ))
 
 def _safe_compose(phase: str) -> str:
@@ -266,4 +429,4 @@ def admin_news_score(symbol: str = "BTC"):
 
 @app.get("/admin/health")
 def admin_health():
-    return {"ok": True, "tag": "v8R2", "ts": int(time.time())}
+    return {"ok": True, "tag": "v8R4", "ts": int(time.time())}
