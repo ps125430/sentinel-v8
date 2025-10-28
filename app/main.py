@@ -18,6 +18,11 @@ def push_to_line(text: str):
 TZ = ZoneInfo("Asia/Taipei")
 app = FastAPI(title="sentinel-v8")
 
+# === Sentinel v8 :: Admin Routers ===
+from app import admin_version
+app.include_router(admin_version.router)
+
+
 # ====== 啟動：確保狀態檔存在 ======
 @app.on_event("startup")
 def on_startup():
