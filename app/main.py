@@ -2,14 +2,15 @@ from __future__ import annotations
 from fastapi import FastAPI, Request
 from apscheduler.schedulers.background import BackgroundScheduler
 from zoneinfo import ZoneInfo
-import re, time
+import os, re, time
 
 from app.state_store import get_state, save_state, set_watch, cleanup_expired, list_watches
 from app.services.prefs import resolve_scheme, set_color_scheme, current_scheme
 from app.services import watches as W
 from app import trend_integrator, news_scoring
 from app import us_stocks, us_news
-from app import badges_radar  # ← 新增：徽章引擎
+from app import badges_radar  # 徽章引擎
+from app.services import version_diff  # ★ 新增：版本差異工具
 
 # ====== 這裡替換成你的 LINE 推播實作 ======
 def push_to_line(text: str):
@@ -22,8 +23,7 @@ app = FastAPI(title="sentinel-v8")
 from app import admin_version
 app.include_router(admin_version.router)
 
-
-# ====== 啟動：確保狀態檔存在 ======
+# ====== 啟動：確保狀態檔存在、徽章刷新、版本基準快照 ======
 @app.on_event("startup")
 def on_startup():
     _ = get_state()
@@ -31,6 +31,13 @@ def on_startup():
     # 啟動時先刷新一次徽章，避免空值
     try:
         badges_radar.refresh_badges()
+    except Exception:
+        pass
+    # 若尚未建立版本基準，啟動時自動建立（寫入 /tmp/sentinel-v8.version-prev.json）
+    try:
+        prev_path = "/tmp/sentinel-v8.version-prev.json"
+        if not os.path.exists(prev_path):
+            version_diff.checkpoint_now(".")
     except Exception:
         pass
 
@@ -123,9 +130,21 @@ async def line_webhook(request: Request):
             replies.append(f"{sym} 設定為{action}，並已監控 1 小時。")
             continue
 
+        # --- 版本核對（★ 新增） ---
+        if t == "版本核對":
+            try:
+                diff = version_diff.diff_now_vs_prev(".")
+                replies.append(diff["summary"])
+            except Exception as e:
+                replies.append(f"版本核對失敗：{e}")
+            continue
+
+        # --- 預設回覆 ---
+        replies.append("指令：今日強勢｜今日弱勢｜美股｜新聞 <幣>｜顏色 台股/美股｜總覽｜版本核對")
+
     return {"messages": replies}
 
-# ====== 報表組裝（含徽章 + 美股三行分組）======
+# ====== 報表組裝（含徽章 + 美股三行分組 + 版本徽章）======
 def compose_report(phase: str) -> str:
     scheme = current_scheme()
 
@@ -135,6 +154,16 @@ def compose_report(phase: str) -> str:
         badges = badges_radar.get_badges()
     except Exception:
         badges = []
+
+    # 補掛版本徽章（即使 badges_radar 尚未整合也能顯示）
+    try:
+        has_delta, badge_txt = version_diff.get_version_badge()
+        if has_delta:
+            if badge_txt not in badges:
+                badges.append(badge_txt)
+    except Exception:
+        pass
+
     badge_str = (" ｜ " + " ".join(f"[{b}]" for b in badges)) if badges else ""
 
     # Crypto 主升浪排行榜
