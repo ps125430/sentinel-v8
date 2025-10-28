@@ -37,4 +37,47 @@ def _fetch_stooq(tickers: List[str]) -> Dict[str, Dict]:
         except Exception:
             continue
         chg = 0.0
-        if o
+        if openp > 0:
+            chg = (close - openp) / openp * 100.0
+        out[sym] = {"symbol": NAME_MAP.get(sym, sym.upper()), "chg": round(chg, 2)}
+    return out
+
+def _risk_on_score(data: Dict[str, Dict]) -> int:
+    if not data:
+        return 50
+    avg = sum([v["chg"] for v in data.values()]) / len(data)
+    score = 50 + avg * 10  # ±2% -> ±20 分
+    return max(0, min(100, int(round(score))))
+
+def format_us_block(phase: str = "night") -> str:
+    """夜報/早報：三行分組（每行 3–4 檔），手機閱讀最順。"""
+    q = _fetch_stooq(CORE_TICKERS)
+    if not q:
+        return "美股觀測：暫時無法取得行情資料。"
+
+    risk = _risk_on_score(q)
+    # 依固定順序輸出
+    ordered = []
+    for t in CORE_TICKERS:
+        if t in q:
+            v = q[t]
+            ordered.append(f"{v['symbol']} {v['chg']:+.2f}%")
+
+    groups = [ordered[0:3], ordered[3:6], ordered[6:10]]
+    grouped_lines = "\n".join("｜".join(g) for g in groups if g)
+
+    title = "📈 美股開盤雷達" if phase == "night" else "🌙 隔夜美股回顧"
+    return f"{title}｜Risk-On：{risk}\n{grouped_lines}"
+
+def format_us_full() -> str:
+    """指令用詳細版：逐檔一行，便於複製與細看。"""
+    q = _fetch_stooq(CORE_TICKERS)
+    if not q:
+        return "美股觀測：暫時無法取得行情資料。"
+    risk = _risk_on_score(q)
+    lines = [f"📊 美股十巨頭｜Risk-On：{risk}"]
+    for t in CORE_TICKERS:
+        if t in q:
+            v = q[t]
+            lines.append(f"{v['symbol']}: {v['chg']:+.2f}%")
+    return "\n".join(lines)
