@@ -1,3 +1,4 @@
+# app/main.py
 from fastapi import FastAPI, Request
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -22,7 +23,7 @@ TZ = ZoneInfo("Asia/Taipei")
 
 app = FastAPI(title="sentinel-v8")
 
-# -------- ENV & 預設（中性風格） --------
+# -------- ENV & 預設 --------
 LINE_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_DEFAULT_TO = os.getenv("LINE_DEFAULT_TO", "")
 line_api = LineBotApi(LINE_TOKEN) if LINE_TOKEN else None
@@ -38,17 +39,17 @@ TH_LONG  = int(os.getenv("TH_LONG", "70"))
 TH_SHORT = int(os.getenv("TH_SHORT", "65"))
 
 # 對稱決策門檻（期望值用）
-DEC_LONG  = int(os.getenv("DEC_LONG", "70"))  # >=70 且相位🔥/⚡ → 多
+DEC_LONG  = int(os.getenv("DEC_LONG", "70"))   # >=70 且相位🔥/⚡ → 多
 DEC_SHORT = int(os.getenv("DEC_SHORT", "30"))  # <=30 且相位🌙或跌幅 → 空
 
 AUTO_SUGGEST = int(os.getenv("AUTO_SUGGEST", "1"))             # 清單顯示 ✅ 建議
 AUTO_TREND_TUNING = int(os.getenv("AUTO_TREND_TUNING", "1"))   # 🔥延長 / 🌙停止
-DEFAULT_COLOR_SCHEME = os.getenv("DEFAULT_COLOR_SCHEME", "tw").lower()  # tw(多紅/空綠) or us(多綠/空紅)
+DEFAULT_COLOR_SCHEME = os.getenv("DEFAULT_COLOR_SCHEME", "tw").lower()  # tw(多紅/空綠) | us(多綠/空紅)
 
 def now_tz() -> datetime:
     return datetime.now(TZ)
 
-def push_text(text: str, to: str | None = None) -> Dict:
+def push_text(text: str, to: Optional[str] = None) -> Dict:
     if not line_api:
         return {"sent": False, "reason": "LINE token not set"}
     target = to or LINE_DEFAULT_TO
@@ -109,9 +110,12 @@ async def fetch_binance_markets(ids: List[str]) -> List[Dict]:
                 vol = float(j.get("quoteVolume", 0.0))
                 cid = next((k for k, v in BINANCE_MAP.items() if v == sym), sym.lower())
                 rows.append({
-                    "id": cid,"symbol": sym.replace("USDT", ""),
-                    "name": cid,"current_price": price,
-                    "price_change_percentage_24h": chg_pct,"total_volume": vol,
+                    "id": cid,
+                    "symbol": sym.replace("USDT", ""),
+                    "name": cid,
+                    "current_price": price,
+                    "price_change_percentage_24h": chg_pct,
+                    "total_volume": vol,
                 })
         return rows
     except Exception as e:
@@ -144,8 +148,14 @@ def score_strong(rows: List[Dict]) -> List[Dict]:
         s_vol = normalize(math.log1p(vol), math.log1p(lo_vol), math.log1p(hi_vol))
         s = (s_chg * 0.6 + s_vol * 0.4) * 100
         out.append({
-            "id": row.get("id"),"symbol": sym,"name": name,"price": price,
-            "chg24h": chg,"volume": vol,"score_strong": round(s, 1),"score_news": 0.0
+            "id": row.get("id"),
+            "symbol": sym,
+            "name": name,
+            "price": price,
+            "chg24h": chg,
+            "volume": vol,
+            "score_strong": round(s, 1),
+            "score_news": 0.0
         })
     return out
 
@@ -165,6 +175,7 @@ def split_long_short(rows: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
 
 # ------- 自動調參（🔥自動延長、🌙自動停止） -------
 tasks: Dict[str, Dict] = {}
+
 def maybe_autotune_watch(rows: List[Dict]):
     """根據趨勢自動調整現有監控：FIRE→延長、MOON→停止"""
     if not AUTO_TREND_TUNING:
@@ -222,8 +233,9 @@ def enrich_readables(rows: List[Dict]) -> List[Dict]:
         r["trend_action_line"] = f"{r.get('trend_icon','')} {r['symbol']}({int(r.get('score_total',0))}) {r.get('action_tag','[觀望]')} — {note} ({r['reason_text']})".strip()
     return rows
 
-# ------- 顏色偏好：台股/美股切換（多紅/空綠 vs 多綠/空紅） -------
-color_pref: Dict[str, str] = {}  # 簡易記憶（重啟會清零）
+# ------- 顏色偏好（多紅/空綠 vs 多綠/空紅） -------
+# 先用記憶體保存；之後可切換到 app/state_store 做持久化
+color_pref: Dict[str, str] = {}
 
 def set_color_pref(owner: str, scheme: str):
     scheme = scheme.lower()
@@ -352,20 +364,23 @@ def help_text() -> str:
             "顏色 台股（多=紅、空=綠）｜顏色 美股（多=綠、空=紅）")
 
 def handle_command_sync(text: str, owner: str):
-    t = text.strip()
+    # 先做正規化：去空白（容忍全形）、保留原字串做其他比對
+    normalized = re.sub(r"\s+", "", (text or ""))
+    t = (text or "").strip()
 
-    # 顏色切換
-    if t in {"顏色 台股","顏色台股","color tw","顏色 TW","顏色 tw"}:
-        if set_color_pref(owner, "tw"):
-            push_text("🎨 已切換顏色為：台股（多=紅、空=綠）", to=owner or None)
-        return "ok"
-    if t in {"顏色 美股","顏色美股","color us","顏色 US","顏色 us"}:
-        if set_color_pref(owner, "us"):
-            push_text("🎨 已切換顏色為：美股（多=綠、空=紅）", to=owner or None)
+    # 顏色切換（模糊匹配：台股/臺股/🇹🇼 都可；其他則視為美股）
+    if normalized.startswith("顏色"):
+        if re.search(r"(台股|臺股|🇹🇼)", normalized):
+            if set_color_pref(owner, "tw"):
+                push_text("🎨 已切換顏色為：台股（多=紅、空=綠）", to=owner or None)
+        else:
+            if set_color_pref(owner, "us"):
+                push_text("🎨 已切換顏色為：美股（多=綠、空=紅）", to=owner or None)
         return "ok"
 
     if t in {"總覽","狀態","status"}:
         push_text(f"📋 監控：{status_list()}", to=owner or None); return "ok"
+
     m = cmd_long.match(t)
     if m: create_or_extend(m.group(1).upper(),"做多",owner); return "ok"
     m = cmd_short.match(t)
@@ -373,11 +388,12 @@ def handle_command_sync(text: str, owner: str):
     m = cmd_plus.match(t)
     if m:
         sym = m.group(1).upper()
-        if sym in tasks: create_or_extend(sym,tasks[sym]["side"],owner)
+        if sym in tasks: create_or_extend(sym, tasks[sym]["side"], owner)
         else: push_text(f"ℹ️ {sym} 尚未建立監控，可用『{sym} 做多』或『{sym} 做空』", to=owner or None)
         return "ok"
     m = cmd_stop.match(t)
     if m: stop_task(m.group(1).upper()); return "ok"
+
     return "async-needed" if t in {"今日強勢","今日弱勢"} else "help"
 
 # ------------------ 路由 ------------------
