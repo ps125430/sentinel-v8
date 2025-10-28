@@ -1,0 +1,17 @@
+# app/symbol_map.py
+MAP = {
+    "bitcoin":  {"coingecko":"bitcoin",  "binance":"BTCUSDT"},
+    "ethereum": {"coingecko":"ethereum", "binance":"ETHUSDT"},
+    "solana":   {"coingecko":"solana",   "binance":"SOLUSDT"},
+    "dogecoin": {"coingecko":"dogecoin", "binance":"DOGEUSDT"},
+    "cardano":  {"coingecko":"cardano",  "binance":"ADAUSDT"},
+    "ripple":   {"coingecko":"ripple",   "binance":"XRPUSDT"},
+    "chainlink":{"coingecko":"chainlink","binance":"LINKUSDT"},
+    "wrapped-bitcoin":{"coingecko":"wrapped-bitcoin","binance":"WBTCUSDT"},
+    "polkadot": {"coingecko":"polkadot", "binance":"DOTUSDT"},
+    "matic-network":{"coingecko":"matic-network","binance":"MATICUSDT"},
+    "avalanche-2":{"coingecko":"avalanche-2","binance":"AVAXUSDT"},
+    "uniswap":  {"coingecko":"uniswap",  "binance":"UNIUSDT"},
+}
+def cg_ids(): return list(MAP.keys())
+def to_binance_id(cg_id: str): return MAP.get(cg_id,{}).get("binance")
