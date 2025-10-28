@@ -6,10 +6,9 @@ import xml.etree.ElementTree as ET
 import urllib.request
 
 CACHE_PATH = os.environ.get("SENTINEL_NEWS_CACHE", "/tmp/sentinel-v8-news.json")
-CACHE_TTL_SEC = 600
-WINDOW_SEC = 24 * 3600
+CACHE_TTL_SEC = 600          # 10 分鐘
+WINDOW_SEC    = 24 * 3600    # 24 小時
 
-# －－情緒詞典（含中英）－－ #
 BULLY = [
     r"surge", r"rally", r"spike", r"breakout", r"record high", r"bull", r"buy", r"rebound",
     r"增持", r"上漲", r"突破", r"利多", r"看多", r"飆升", r"新高", r"大漲", r"反彈",
@@ -36,7 +35,7 @@ KEYWORDS = {
     "LTC": ["litecoin", "ltc", "萊特幣"],
 }
 
-# —— 內部工具 —— #
+# ---------- 基礎工具 ---------- #
 def _now() -> int:
     return int(time.time())
 
@@ -46,7 +45,7 @@ def _load_cache() -> Dict:
             with open(CACHE_PATH, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
-            return {}
+            pass
     return {}
 
 def _save_cache(data: Dict) -> None:
@@ -72,8 +71,7 @@ def _parse_rss(xml_bytes: bytes) -> List[Tuple[str, str, int]]:
         for item in root.findall(".//item"):
             title = (item.findtext("title") or "").strip()
             link  = (item.findtext("link") or "").strip()
-            pub   = (item.findtext("{http://purl.org/dc/elements/1.1/}date")
-                     or item.findtext("pubDate") or "")
+            pub   = (item.findtext("{http://purl.org/dc/elements/1.1/}date") or item.findtext("pubDate") or "")
             pub_ts = _parse_pubdate(pub)
             if title and link:
                 out.append((html.unescape(title), link, pub_ts))
@@ -89,90 +87,116 @@ def _parse_pubdate(s: str) -> int:
     except Exception:
         return _now()
 
-# —— 新增：自動翻譯英文為中文 —— #
 def _translate_to_zh(text: str) -> str:
-    """使用 Google 翻譯輕量版（不需 API key）"""
     try:
         q = quote_plus(text)
         url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=zh-TW&dt=t&q={q}"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.load(resp)
-        # 資料結構：[ [[ "翻譯後句子", "原文", None, None ... ], ...], ...]
-        zh = "".join([seg[0] for seg in data[0] if seg and seg[0]])
-        return zh
+        return "".join([seg[0] for seg in data[0] if seg and seg[0]])
     except Exception:
-        return text  # 失敗時原樣返回
+        return text
 
 def _score_text(title: str) -> float:
     t = title.lower()
     score = 0.0
     for p in BULLY:
-        if re.search(p, t, re.I):
-            score += 1.0
+        if re.search(p, t, re.I): score += 1.0
     for p in BEARY:
-        if re.search(p, t, re.I):
-            score -= 1.0
+        if re.search(p, t, re.I): score -= 1.0
     return score
 
 def _time_weight(pub_ts: int, now_ts: int) -> float:
     dt = now_ts - pub_ts
-    if dt < 0:
-        dt = 0
-    if dt >= WINDOW_SEC:
-        return 0.0
+    if dt < 0: dt = 0
+    if dt >= WINDOW_SEC: return 0.0
     return max(0.0, 1.0 - dt / WINDOW_SEC)
+
+def _timeago(ts: int, now_ts: int | None = None) -> str:
+    now = int(now_ts or _now())
+    d = max(0, now - int(ts))
+    if d < 60: return f"{d}秒前"
+    m = d // 60
+    if m < 60: return f"{m}分鐘前"
+    h = m // 60
+    return f"{h}小時前"
 
 def _search_queries(symbol: str) -> List[str]:
     sym = symbol.upper()
     words = KEYWORDS.get(sym, [sym])
-    queries = []
+    qs = []
     for w in words:
-        queries.append(_google_news_rss(w, hl="en-US", gl="US", ceid="US:en"))
-        queries.append(_google_news_rss(w, hl="zh-TW", gl="TW", ceid="TW:zh-Hant"))
-    return queries
+        qs.append(_google_news_rss(w, hl="en-US", gl="US", ceid="US:en"))
+        qs.append(_google_news_rss(w, hl="zh-TW", gl="TW", ceid="TW:zh-Hant"))
+    return qs
 
-def _score_symbol(symbol: str, now_ts: int) -> int:
+# ---------- 核心：計分 + 標題彙整（中文） ---------- #
+def _score_and_collect(symbol: str, now_ts: int) -> tuple[int, list]:
+    """回傳 (0~100 分, items[dict])；items 含 zh_title/link/pub_ts/weight/raw_score"""
     cache = _load_cache()
     ent = cache.get(symbol)
     if ent and (now_ts - int(ent.get("ts", 0)) < CACHE_TTL_SEC):
-        return int(ent.get("score", 0))
+        return int(ent.get("score", 0)), ent.get("items", [])
 
     seen = set()
     total = 0.0
-    cnt = 0
+    items: List[Dict] = []
     for url in _search_queries(symbol):
         try:
             raw = _fetch_url(url)
-            items = _parse_rss(raw)
+            rows = _parse_rss(raw)
         except Exception:
-            items = []
-        for title, link, pub_ts in items:
+            rows = []
+        for title, link, pub_ts in rows:
             key = (title, link)
-            if key in seen:
-                continue
+            if key in seen: continue
             seen.add(key)
             w = _time_weight(pub_ts, now_ts)
-            if w <= 0:
-                continue
-            # —— 先翻譯再判斷 —— #
+            if w <= 0: continue
             zh_title = _translate_to_zh(title)
             s = _score_text(zh_title)
             total += s * w
-            cnt += 1
+            items.append({
+                "zh_title": zh_title, "link": link, "pub_ts": int(pub_ts),
+                "weight": round(w, 3), "raw_score": s
+            })
 
+    # 將 raw (-K..K) 映射到 0..100
     K = 10.0
     raw = max(-K, min(K, total))
-    norm = int(round((raw + K) / (2 * K) * 100))
-    cache[symbol] = {"ts": now_ts, "score": norm, "samples": cnt}
+    norm = int(round((raw + K) / (2*K) * 100))
+
+    # 以權重 * |raw_score| 排序，挑相對重要的中文標題
+    items.sort(key=lambda r: (abs(r.get("raw_score", 0)) * r.get("weight", 0)), reverse=True)
+    cache[symbol] = {"ts": now_ts, "score": norm, "items": items[:20]}  # 留 20 則供查詢
     _save_cache(cache)
-    return norm
+    return norm, items[:20]
 
 def get_news_score(symbol: str) -> int:
     try:
-        return _score_symbol(symbol.upper(), _now())
+        score, _ = _score_and_collect(symbol.upper(), _now())
+        return score
     except Exception:
         return 0
 
+def recent_headlines(symbol: str, k: int = 3) -> List[Dict]:
+    """回傳 [{title_zh, link, timeago}] * k"""
+    try:
+        _, items = _score_and_collect(symbol.upper(), _now())
+        out = []
+        for it in items[:max(0, k)]:
+            out.append({
+                "title_zh": it.get("zh_title", ""),
+                "link": it.get("link", ""),
+                "timeago": _timeago(int(it.get("pub_ts", 0)))
+            })
+        return out
+    except Exception:
+        return []
+
 def batch_news_score(symbols: List[str]) -> Dict[str, int]:
     return {s.upper(): get_news_score(s) for s in symbols}
+
+def batch_recent_headlines(symbols: List[str], k: int = 3) -> Dict[str, List[Dict]]:
+    return {s.upper(): recent_headlines(s, k=k) for s in symbols}
