@@ -41,7 +41,7 @@ def on_startup():
     except Exception:
         pass
 
-# ====== LINE Webhook（文字指令處理）======
+# ====== LINE Webhook（文字指令處理）—— 覆蓋版，優先處理《版本核對》======
 @app.post("/line/webhook")
 async def line_webhook(request: Request):
     payload = await request.json()
@@ -49,8 +49,18 @@ async def line_webhook(request: Request):
     replies = []
 
     for ev in events:
-        text = (ev.get("message", {}) or {}).get("text", "") or ""
-        t = re.sub(r"\s+", " ", text.replace("\u3000", " ")).strip()
+        raw = (ev.get("message", {}) or {}).get("text", "") or ""
+        # 標準化空白、全形空白
+        t = re.sub(r"\s+", " ", raw.replace("\u3000", " ")).strip()
+
+        # --- 版本核對：最優先判斷 ---
+        if t == "版本核對":
+            try:
+                diff = version_diff.diff_now_vs_prev(".")
+                replies.append(diff["summary"])
+            except Exception as e:
+                replies.append(f"版本核對失敗：{e}")
+            continue
 
         # --- 配色 ---
         if t.startswith("顏色"):
@@ -97,7 +107,7 @@ async def line_webhook(request: Request):
             want_strong = (t == "今日強勢")
             try:
                 msg = trend_integrator.generate_side(single=t, scheme=scheme, want_strong=want_strong, topn=3)
-                # 提取此次上榜 symbols
+                # 附帶每個上榜幣 2 則中文新聞
                 syms = []
                 for line in msg.splitlines():
                     m = re.search(r"\b([A-Z]{2,10})\b", line)
@@ -106,7 +116,6 @@ async def line_webhook(request: Request):
                         if s not in ("S", "N", "T"):
                             syms.append(s)
                 syms = [s for s in syms if s.isalpha()]
-                # 附加各幣 2 則中文新聞
                 hmap = news_scoring.batch_recent_headlines(syms, k=2) if syms else {}
                 if hmap:
                     msg += "\n\n🗞️ 中文新聞精選"
@@ -130,19 +139,11 @@ async def line_webhook(request: Request):
             replies.append(f"{sym} 設定為{action}，並已監控 1 小時。")
             continue
 
-        # --- 版本核對（★ 新增） ---
-        if t == "版本核對":
-            try:
-                diff = version_diff.diff_now_vs_prev(".")
-                replies.append(diff["summary"])
-            except Exception as e:
-                replies.append(f"版本核對失敗：{e}")
-            continue
-
-        # --- 預設回覆 ---
+        # --- 預設回覆（你的既有文案可以放這） ---
         replies.append("指令：今日強勢｜今日弱勢｜美股｜新聞 <幣>｜顏色 台股/美股｜總覽｜版本核對")
 
     return {"messages": replies}
+
 
 # ====== 報表組裝（含徽章 + 美股三行分組 + 版本徽章）======
 def compose_report(phase: str) -> str:
