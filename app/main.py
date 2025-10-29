@@ -1,9 +1,9 @@
 # =========================
-# app/main.py 〔覆蓋版・一鍵貼上 v8R7-TWNEWS〕
+# app/main.py 〔覆蓋版・一鍵貼上 v8R8-TWLIST〕
 # Sentinel v8 · FastAPI + APScheduler + LINE Reply
-# 新增：台股新聞（tw_news）；早/午報自動附台股新聞；LINE 指令「台股新聞」
-# 內建：save_state 相容層、版本核對 API、台股/美股/幣圈開關、台股三行分組
-# ＊所有回覆加「【v8R7-TWNEWS】」
+# 新增：台股觀察清單動態管理（加入/移除/清單）
+# 保留：台股新聞、台股三行分組、模組開關、save_state 相容層、版本核對、四時段報表
+# ＊所有回覆加「【v8R8-TWLIST】」
 # =========================
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from app import trend_integrator, news_scoring
 from app import us_stocks, us_news
 from app import badges_radar
 from app import tw_stocks
-from app import tw_news   # ★ 新增
+from app import tw_news
 
 # ======= save_state 相容層 =======
 try:
@@ -160,29 +160,29 @@ def ensure_prefs_defaults():
 # ========= 啟動 =========
 @app.on_event("startup")
 def on_startup():
-    print("[BOOT][v8R7-TWNEWS] starting…")
+    print("[BOOT][v8R8-TWLIST] starting…")
     _ = get_state(); _persist()
     ensure_prefs_defaults()
     try:
         badges_radar.refresh_badges()
-        print("[BOOT][v8R7-TWNEWS] badges refreshed")
+        print("[BOOT][v8R8-TWLIST] badges refreshed")
     except Exception as e:
-        print("[BOOT][v8R7-TWNEWS] badges init err:", e)
+        print("[BOOT][v8R8-TWLIST] badges init err:", e)
     try:
         if not os.path.exists(BASELINE_PATH):
             version_diff.checkpoint_now(".")
-            print("[BOOT][v8R7-TWNEWS] version baseline created")
+            print("[BOOT][v8R8-TWLIST] version baseline created")
     except Exception as e:
-        print("[BOOT][v8R7-TWNEWS] version baseline err:", e)
+        print("[BOOT][v8R8-TWLIST] version baseline err:", e)
 
 # ========= 管理/診斷 =========
 @app.get("/")
 def root():
-    return {"ok": True, "tag": "v8R7-TWNEWS", "ts": int(time.time())}
+    return {"ok": True, "tag": "v8R8-TWLIST", "ts": int(time.time())}
 
 @app.get("/admin/env-lite")
 def env_lite():
-    return {"tag": "v8R7-TWNEWS", "has_line_token": bool(LINE_ACCESS_TOKEN), "has_push_target": bool(LINE_PUSH_TO)}
+    return {"tag": "v8R8-TWLIST", "has_line_token": bool(LINE_ACCESS_TOKEN), "has_push_target": bool(LINE_PUSH_TO)}
 
 @app.get("/admin/ping-services")
 def ping_services():
@@ -222,20 +222,20 @@ def admin_version_badge():
 
 # ========= 推播封裝 =========
 def push_to_line(text: str):
-    msg = f"【v8R7-TWNEWS】{text}"
+    msg = f"【v8R8-TWLIST】{text}"
     if line_bot_api and LINE_PUSH_TO:
         try:
             line_bot_api.push_message(LINE_PUSH_TO, TextSendMessage(msg))
-            print("[PUSH][v8R7-TWNEWS] sent to LINE_PUSH_TO"); return
+            print("[PUSH][v8R8-TWLIST] sent to LINE_PUSH_TO"); return
         except Exception as e:
-            print(f"[PUSH][v8R7-TWNEWS] error:", e)
-    print("[PUSH][v8R7-TWNEWS] console:", msg)
+            print(f"[PUSH][v8R8-TWLIST] error:", e)
+    print("[PUSH][v8R8-TWLIST] console:", msg)
 
 # ========= LINE Webhook =========
 @app.post("/line/webhook")
 async def line_webhook(request: Request):
     payload = await request.json()
-    print("[WH][v8R7-TWNEWS] inbound:", json.dumps(payload, ensure_ascii=False)[:400])
+    print("[WH][v8R8-TWLIST] inbound:", json.dumps(payload, ensure_ascii=False)[:400])
     events = payload.get("events", [])
     out = []
 
@@ -243,17 +243,17 @@ async def line_webhook(request: Request):
         raw = (ev.get("message", {}) or {}).get("text", "") or ""
         reply_token = ev.get("replyToken")
         t = re.sub(r"\s+", " ", raw.replace("\u3000", " ")).strip()
-        print(f"[WH][v8R7-TWNEWS] text='{t}' reply_token={'Y' if reply_token else 'N'}")
+        print(f"[WH][v8R8-TWLIST] text='{t}' reply_token={'Y' if reply_token else 'N'}")
 
         def reply(msg: str):
-            tagged = f"【v8R7-TWNEWS】{msg}"
+            tagged = f"【v8R8-TWLIST】{msg}"
             out.append(tagged)
             if line_bot_api and reply_token:
                 try:
                     line_bot_api.reply_message(reply_token, TextSendMessage(tagged))
-                    print("[WH][v8R7-TWNEWS] replied via Reply API")
+                    print("[WH][v8R8-TWLIST] replied via Reply API")
                 except Exception as e:
-                    print("[WH][v8R7-TWNEWS] reply error:", e)
+                    print("[WH][v8R8-TWLIST] reply error:", e)
 
         # === 模組開關（美股 / 台股 / 虛擬貨幣）===
         m_toggle = re.match(r"^(美股|台股|虛擬貨幣)\s*(開啟|關閉)$", t)
@@ -266,6 +266,7 @@ async def line_webhook(request: Request):
             reply(f"{mod} 已{act}。目前：美股={'開' if prefs.get('enable_us') else '關'}｜台股={'開' if prefs.get('enable_tw') else '關'}｜幣圈={'開' if prefs.get('enable_crypto') else '關'}")
             continue
 
+        # 模組狀態
         if t in ("模組狀態", "狀態", "status"):
             prefs = get_state().get("prefs", {})
             reply(f"模組狀態：美股={'開' if prefs.get('enable_us', True) else '關'}｜台股={'開' if prefs.get('enable_tw', True) else '關'}｜幣圈={'開' if prefs.get('enable_crypto', True) else '關'}")
@@ -286,6 +287,20 @@ async def line_webhook(request: Request):
             reply(set_color_scheme(scheme) if scheme else "請說明要切換到「台股」或「美股」配色。")
             continue
 
+        # === 台股觀察清單操作 ===
+        m_add = re.match(r"^加入台股\s*([A-Za-z0-9%_.\-]+)$", t)
+        if m_add:
+            sym = m_add.group(1)
+            reply(tw_stocks.add_symbol(sym)); continue
+
+        m_del = re.match(r"^移除台股\s*([A-Za-z0-9%_.\-]+)$", t)
+        if m_del:
+            sym = m_del.group(1)
+            reply(tw_stocks.remove_symbol(sym)); continue
+
+        if t in ("台股清單", "台股觀察清單"):
+            reply(tw_stocks.list_symbols()); continue
+
         # 新聞 <幣>
         m_news = re.match(r"^\s*新聞\s+([A-Za-z0-9_\-\.]+)\s*$", t)
         if m_news:
@@ -299,6 +314,12 @@ async def line_webhook(request: Request):
                 reply("\n".join(lines))
             continue
 
+        # 台股新聞（中文）
+        if t in ("台股新聞", "台灣股市新聞", "TW 新聞"):
+            if not get_state().get("prefs", {}).get("enable_tw", True):
+                reply("台股模組目前關閉。可用：『台股 開啟』"); continue
+            reply(tw_news.format_tw_news_block(k=5)); continue
+
         # 美股詳細
         if t == "美股":
             if not get_state().get("prefs", {}).get("enable_us", True):
@@ -311,12 +332,6 @@ async def line_webhook(request: Request):
             if not get_state().get("prefs", {}).get("enable_tw", True):
                 reply("台股模組目前關閉。可用：『台股 開啟』"); continue
             reply(tw_stocks.format_tw_full()); continue
-
-        # 台股新聞（中文）
-        if t in ("台股新聞", "台灣股市新聞", "TW 新聞"):
-            if not get_state().get("prefs", {}).get("enable_tw", True):
-                reply("台股模組目前關閉。可用：『台股 開啟』"); continue
-            reply(tw_news.format_tw_news_block(k=5)); continue
 
         # 監控延長 + / 停止 -
         sym = W.parse_plus(t)
@@ -363,7 +378,7 @@ async def line_webhook(request: Request):
             reply(f"{sym} 設定為{action}，並已監控 1 小時。"); continue
 
         # 預設回覆
-        reply("指令：台股｜台股新聞｜美股｜今日強勢｜今日弱勢｜新聞 <幣>｜顏色 台股/美股｜總覽｜版本核對｜版本差異｜模組狀態｜（美股/台股/虛擬貨幣）開啟/關閉")
+        reply("指令：台股｜台股清單｜加入台股 <代號>｜移除台股 <代號>｜台股新聞｜美股｜今日強勢｜今日弱勢｜新聞 <幣>｜顏色 台股/美股｜總覽｜版本核對｜版本差異｜模組狀態｜（美股/台股/虛擬貨幣）開啟/關閉")
 
     return {"messages": out}
 
@@ -469,4 +484,4 @@ def admin_news_score(symbol: str = "BTC"):
 
 @app.get("/admin/health")
 def admin_health():
-    return {"ok": True, "tag": "v8R7-TWNEWS", "ts": int(time.time())}
+    return {"ok": True, "tag": "v8R8-TWLIST", "ts": int(time.time())}
