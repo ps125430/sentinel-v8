@@ -1,10 +1,8 @@
 # =========================
-# app/main.py 〔覆蓋版・一鍵貼上 R5〕
-# Sentinel v8 · FastAPI + APScheduler + LINE Reply
-# 新增：模組開關（美股 / 虛擬貨幣），報表動態顯示
+# app/main.py 〔覆蓋版・一鍵貼上 R6〕
+# 新增：台股模組（tw_stocks），可開關；報表早/午/晚顯示台股區塊
 # 內建：/admin/env-lite、/admin/ping-services、/admin/version-*
-# 內建：version_diff 後備實作（即使沒有 app/services/version_diff.py 也能跑）
-# ＊所有回覆加「【v8R5】」指紋；logs 帶 [WH][v8R5]/[PUSH][v8R5]
+# ＊所有回覆加「【v8R6】」指紋；logs 帶 [WH][v8R6]/[PUSH][v8R6]
 # =========================
 
 from __future__ import annotations
@@ -14,15 +12,15 @@ from typing import Dict, Any, Tuple
 from fastapi import FastAPI, Request
 from apscheduler.schedulers.background import BackgroundScheduler
 
-# --- 既有模組 ---
 from app.state_store import get_state, save_state, set_watch, cleanup_expired, list_watches
 from app.services.prefs import resolve_scheme, set_color_scheme, current_scheme
 from app.services import watches as W
 from app import trend_integrator, news_scoring
 from app import us_stocks, us_news
 from app import badges_radar
+from app import tw_stocks  # ★ 新增
 
-# ============ version_diff：優先載入正式版，失敗時使用內建後備 ============
+# ======= 版本差異 fallback（沿用 R5）=======
 BASELINE_PATH = "/tmp/sentinel-v8.version-prev.json"
 SCAN_ROOT = "."
 
@@ -125,11 +123,10 @@ try:
 except Exception:
     version_diff = _VersionDiffFallback()  # type: ignore
 
-# ============ LINE SDK ============
+# ============ LINE ============
 from linebot import LineBotApi
 from linebot.models import TextSendMessage
 
-# ========= 基本設定 =========
 TZ = ZoneInfo("Asia/Taipei")
 app = FastAPI(title="sentinel-v8")
 
@@ -137,79 +134,66 @@ LINE_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_PUSH_TO = os.getenv("LINE_PUSH_TO", "")
 line_bot_api = LineBotApi(LINE_ACCESS_TOKEN) if LINE_ACCESS_TOKEN else None
 
-# ========= 偏好開關：預設值確立 =========
+# ========= 偏好開關（含台股） =========
 def ensure_prefs_defaults():
     st = get_state()
     prefs = st.setdefault("prefs", {})
-    if "enable_us" not in prefs:        # 美股模組
-        prefs["enable_us"] = True
-    if "enable_crypto" not in prefs:     # 虛擬貨幣模組
-        prefs["enable_crypto"] = True
+    prefs.setdefault("enable_us", True)
+    prefs.setdefault("enable_crypto", True)
+    prefs.setdefault("enable_tw", True)  # ★ 新增：台股
     save_state(st)
     return prefs
 
-# ========= 啟動流程 =========
+# ========= 啟動 =========
 @app.on_event("startup")
 def on_startup():
-    print("[BOOT][v8R5] starting…")
+    print("[BOOT][v8R6] starting…")
     _ = get_state(); save_state()
     ensure_prefs_defaults()
     try:
         badges_radar.refresh_badges()
-        print("[BOOT][v8R5] badges refreshed")
+        print("[BOOT][v8R6] badges refreshed")
     except Exception as e:
-        print("[BOOT][v8R5] badges init err:", e)
+        print("[BOOT][v8R6] badges init err:", e)
     try:
         if not os.path.exists(BASELINE_PATH):
             version_diff.checkpoint_now(".")
-            print("[BOOT][v8R5] version baseline created")
+            print("[BOOT][v8R6] version baseline created")
     except Exception as e:
-        print("[BOOT][v8R5] version baseline err:", e)
+        print("[BOOT][v8R6] version baseline err:", e)
 
-# ========= 健康檢查 / 診斷 =========
+# ========= 管理/診斷 =========
 @app.get("/")
 def root():
-    return {"ok": True, "tag": "v8R5", "ts": int(time.time())}
+    return {"ok": True, "tag": "v8R6", "ts": int(time.time())}
 
 @app.get("/admin/env-lite")
 def env_lite():
-    return {"tag": "v8R5", "has_line_token": bool(LINE_ACCESS_TOKEN), "has_push_target": bool(LINE_PUSH_TO)}
+    return {"tag": "v8R6", "has_line_token": bool(LINE_ACCESS_TOKEN), "has_push_target": bool(LINE_PUSH_TO)}
 
 @app.get("/admin/ping-services")
 def ping_services():
     def check(modname):
         try:
-            __import__(modname)
-            return True, ""
+            __import__(modname); return True, ""
         except Exception as e:
             return False, str(e)
     ok_prefs, err_prefs = check("app.services.prefs")
     ok_watches, err_watches = check("app.services.watches")
-    try:
-        from app.services import version_diff as _vd  # type: ignore
-        ok_vd = _vd is not None
-        err_vd = "" if ok_vd else "module not present (optional)"
-    except Exception as e:
-        ok_vd, err_vd = False, str(e)
-    return {"ok": {"prefs": ok_prefs, "watches": ok_watches, "version_diff": ok_vd},
-            "errors": {"prefs": err_prefs, "watches": err_watches, "version_diff": err_vd}}
+    ok_tw, err_tw       = check("app.tw_stocks")
+    return {"ok": {"prefs": ok_prefs, "watches": ok_watches, "tw_stocks": ok_tw},
+            "errors": {"prefs": err_prefs, "watches": err_watches, "tw_stocks": err_tw}}
 
-# ========= 版本 API（內建）=========
 @app.post("/admin/version-snapshot")
 def admin_version_snapshot():
-    try:
-        res = version_diff.checkpoint_now(".")
-        return {"ok": True, "res": res}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+    try: return {"ok": True, "res": version_diff.checkpoint_now(".")}
+    except Exception as e: return {"ok": False, "error": str(e)}
 
 @app.get("/admin/version-diff")
 def admin_version_diff(save: int = 0):
     try:
         res = version_diff.diff_now_vs_prev(".")
-        if save:
-            version_diff.checkpoint_now(".")
-            res["saved"] = True
+        if save: version_diff.checkpoint_now("."); res["saved"] = True
         return res
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -222,23 +206,22 @@ def admin_version_badge():
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# ========= LINE 推播（排程用）=========
+# ========= 推播封裝 =========
 def push_to_line(text: str):
-    msg = f"【v8R5】{text}"
+    msg = f"【v8R6】{text}"
     if line_bot_api and LINE_PUSH_TO:
         try:
             line_bot_api.push_message(LINE_PUSH_TO, TextSendMessage(msg))
-            print("[PUSH][v8R5] sent to LINE_PUSH_TO")
-            return
+            print("[PUSH][v8R6] sent to LINE_PUSH_TO"); return
         except Exception as e:
-            print(f"[PUSH][v8R5] error:", e)
-    print("[PUSH][v8R5] console:", msg)
+            print(f"[PUSH][v8R6] error:", e)
+    print("[PUSH][v8R6] console:", msg)
 
-# ========= LINE Webhook（回覆＋強 log）=========
+# ========= LINE Webhook =========
 @app.post("/line/webhook")
 async def line_webhook(request: Request):
     payload = await request.json()
-    print("[WH][v8R5] inbound:", json.dumps(payload, ensure_ascii=False)[:400])
+    print("[WH][v8R6] inbound:", json.dumps(payload, ensure_ascii=False)[:400])
     events = payload.get("events", [])
     out = []
 
@@ -246,38 +229,36 @@ async def line_webhook(request: Request):
         raw = (ev.get("message", {}) or {}).get("text", "") or ""
         reply_token = ev.get("replyToken")
         t = re.sub(r"\s+", " ", raw.replace("\u3000", " ")).strip()
-        print(f"[WH][v8R5] text='{t}' reply_token={'Y' if reply_token else 'N'}")
+        print(f"[WH][v8R6] text='{t}' reply_token={'Y' if reply_token else 'N'}")
 
         def reply(msg: str):
-            tagged = f"【v8R5】{msg}"
+            tagged = f"【v8R6】{msg}"
             out.append(tagged)
             if line_bot_api and reply_token:
                 try:
                     line_bot_api.reply_message(reply_token, TextSendMessage(tagged))
-                    print("[WH][v8R5] replied via Reply API")
+                    print("[WH][v8R6] replied via Reply API")
                 except Exception as e:
-                    print("[WH][v8R5] reply error:", e)
+                    print("[WH][v8R6] reply error:", e)
 
-        # === 模組開關：美股 / 虛擬貨幣 ===
-        m_toggle = re.match(r"^(美股|虛擬貨幣)\s*(開啟|關閉)$", t)
+        # === 模組開關（美股 / 台股 / 虛擬貨幣）===
+        m_toggle = re.match(r"^(美股|台股|虛擬貨幣)\s*(開啟|關閉)$", t)
         if m_toggle:
             mod, act = m_toggle.groups()
-            key = "enable_us" if mod == "美股" else "enable_crypto"
+            key = {"美股":"enable_us","台股":"enable_tw","虛擬貨幣":"enable_crypto"}[mod]
             val = (act == "開啟")
-            st = get_state()
-            st.setdefault("prefs", {})[key] = val
-            save_state(st)
-            reply(f"{mod} 已{act}。目前狀態：美股={'開' if st['prefs'].get('enable_us') else '關'}｜虛擬貨幣={'開' if st['prefs'].get('enable_crypto') else '關'}")
+            st = get_state(); st.setdefault("prefs", {})[key] = val; save_state(st)
+            prefs = st["prefs"]
+            reply(f"{mod} 已{act}。目前：美股={'開' if prefs.get('enable_us') else '關'}｜台股={'開' if prefs.get('enable_tw') else '關'}｜幣圈={'開' if prefs.get('enable_crypto') else '關'}")
             continue
 
-        # 模組狀態查詢
         if t in ("模組狀態", "狀態", "status"):
-            st = get_state(); prefs = st.get("prefs", {})
-            reply(f"模組狀態：美股={'開' if prefs.get('enable_us', True) else '關'}｜虛擬貨幣={'開' if prefs.get('enable_crypto', True) else '關'}")
+            prefs = get_state().get("prefs", {})
+            reply(f"模組狀態：美股={'開' if prefs.get('enable_us', True) else '關'}｜台股={'開' if prefs.get('enable_tw', True) else '關'}｜幣圈={'開' if prefs.get('enable_crypto', True) else '關'}")
             continue
 
-        # 版本核對 / 差異（最優先，含別名）
-        if t in ("版本核對", "版本差異", "版本差异", "version diff", "version-diff", "ver diff"):
+        # 版本核對/差異
+        if t in ("版本核對","版本差異","版本差异","version diff","version-diff","ver diff"):
             try:
                 diff = version_diff.diff_now_vs_prev(".")
                 reply(diff.get("summary") or "版本比對完成（無摘要）")
@@ -296,8 +277,7 @@ async def line_webhook(request: Request):
         if m_news:
             sym = m_news.group(1).upper()
             heads = news_scoring.recent_headlines(sym, k=5)
-            if not heads:
-                reply(f"{sym} 近 24 小時無新聞或暫時無法取得。")
+            if not heads: reply(f"{sym} 近 24 小時無新聞或暫時無法取得。")
             else:
                 lines = [f"🗞️ {sym} 近 24 小時重點新聞（中文）"]
                 for i, h in enumerate(heads, 1):
@@ -305,37 +285,34 @@ async def line_webhook(request: Request):
                 reply("\n".join(lines))
             continue
 
-        # 美股（詳細）
+        # 美股詳細
         if t == "美股":
-            st = get_state()
-            if not st.get("prefs", {}).get("enable_us", True):
-                reply("美股模組目前關閉。可用：『美股 開啟』")
-                continue
-            block = us_stocks.format_us_full()
-            nblk = us_news.format_us_news_block(k_each=2, max_topics=6)
-            reply(f"{block}\n\n{nblk}")
-            continue
+            if not get_state().get("prefs", {}).get("enable_us", True):
+                reply("美股模組目前關閉。可用：『美股 開啟』"); continue
+            block = us_stocks.format_us_full(); nblk = us_news.format_us_news_block(k_each=2, max_topics=6)
+            reply(f"{block}\n\n{nblk}"); continue
+
+        # 台股詳細
+        if t == "台股":
+            if not get_state().get("prefs", {}).get("enable_tw", True):
+                reply("台股模組目前關閉。可用：『台股 開啟』"); continue
+            reply(tw_stocks.format_tw_full()); continue
 
         # 監控延長 + / 停止 -
         sym = W.parse_plus(t)
-        if sym:
-            reply(W.extend(sym, hours=1)); continue
+        if sym: reply(W.extend(sym, hours=1)); continue
         sym = W.parse_minus(t)
-        if sym:
-            reply(W.stop(sym)); continue
+        if sym: reply(W.stop(sym)); continue
 
         # 總覽
-        if t in ("總覽", "監控", "監控列表", "監控清單"):
+        if t in ("總覽","監控","監控列表","監控清單"):
             reply(W.summarize()); continue
 
-        # 今日強勢 / 今日弱勢（含中文新聞）
+        # 今日強勢/弱勢（幣圈）
         if t in ("今日強勢", "今日弱勢"):
-            st = get_state()
-            if not st.get("prefs", {}).get("enable_crypto", True):
-                reply("虛擬貨幣模組目前關閉。可用：『虛擬貨幣 開啟』")
-                continue
-            scheme = current_scheme()
-            want_strong = (t == "今日強勢")
+            if not get_state().get("prefs", {}).get("enable_crypto", True):
+                reply("虛擬貨幣模組目前關閉。可用：『虛擬貨幣 開啟』"); continue
+            scheme = current_scheme(); want_strong = (t == "今日強勢")
             try:
                 msg = trend_integrator.generate_side(single=t, scheme=scheme, want_strong=want_strong, topn=3)
                 syms = []
@@ -358,20 +335,19 @@ async def line_webhook(request: Request):
                 msg = f"{t} 生成失敗：{e}\n（外部資料源可能限流 429/451，稍後再試）"
             reply(msg); continue
 
-        # <幣> 做多/做空：建立 1h 監控
+        # 幣 做多/做空
         m = re.match(r"^\s*([A-Za-z0-9_\-\.]+)\s*(做多|做空)\s*$", t)
         if m:
             sym, action = m.group(1).upper(), m.group(2)
             set_watch(sym, int(time.time()) + 3600)
-            reply(f"{sym} 設定為{action}，並已監控 1 小時。")
-            continue
+            reply(f"{sym} 設定為{action}，並已監控 1 小時。"); continue
 
         # 預設回覆
-        reply("指令：今日強勢｜今日弱勢｜美股｜新聞 <幣>｜顏色 台股/美股｜總覽｜版本核對｜版本差異｜模組狀態｜美股/虛擬貨幣 開啟/關閉")
+        reply("指令：台股｜美股｜今日強勢｜今日弱勢｜新聞 <幣>｜顏色 台股/美股｜總覽｜版本核對｜版本差異｜模組狀態｜（美股/台股/虛擬貨幣）開啟/關閉")
 
     return {"messages": out}
 
-# ========= 報表（四時段；依開關動態呈現）=========
+# ========= 報表（四時段；台股在早/午/晚）=========
 def compose_report(phase: str) -> str:
     prefs = ensure_prefs_defaults()
     scheme = current_scheme()
@@ -383,33 +359,39 @@ def compose_report(phase: str) -> str:
     try:
         has_delta, badge_txt = version_diff.get_version_badge()
         if has_delta and badge_txt not in badges: badges.append(badge_txt)
-    except Exception:
-        pass
+    except Exception: pass
     badge_str = (" ｜ " + " ".join(f"[{b}]" for b in badges)) if badges else ""
 
-    parts = [f"【{phase}報】配色：{scheme}{badge_str}"]
+    parts = [f"【{phase}報】配色：{scheme}{badge_str}", f"監控：{W.summarize()}", ""]
 
-    # 監控清單
-    parts += [f"監控：{W.summarize()}", ""]
+    # 台股：早/午/晚顯示
+    if prefs.get("enable_tw", True) and phase in ("morning","noon","evening"):
+        try:
+            parts += [tw_stocks.format_tw_block(phase=phase), ""]
+        except Exception as e:
+            parts += [f"台股區塊生成失敗：{e}", ""]
 
-    # 美股區塊（受開關控制）
+    # 美股：夜＝開盤雷達＋新聞；早＝隔夜回顧
     if prefs.get("enable_us", True):
         if phase == "night":
-            us_block = us_stocks.format_us_block(phase="night")
-            us_news_block = us_news.format_us_news_block(k_each=2, max_topics=6)
-            parts += [f"{us_block}\n\n{us_news_block}", ""]
+            try:
+                us_block = us_stocks.format_us_block(phase="night")
+                us_news_block = us_news.format_us_news_block(k_each=2, max_topics=6)
+                parts += [f"{us_block}\n\n{us_news_block}", ""]
+            except Exception as e:
+                parts += [f"美股區塊生成失敗：{e}", ""]
         elif phase == "morning":
-            parts += [us_stocks.format_us_block(phase="morning"), ""]
-    else:
-        parts += ["（美股模組已關閉）", ""]
+            try:
+                parts += [us_stocks.format_us_block(phase="morning"), ""]
+            except Exception as e:
+                parts += [f"美股區塊生成失敗：{e}", ""]
 
-    # Crypto 主升浪（受開關控制）
+    # 幣圈主升浪
     if prefs.get("enable_crypto", True):
         try:
-            ti = trend_integrator.generate_report(scheme=scheme, topn=3)
+            parts.append(trend_integrator.generate_report(scheme=scheme, topn=3))
         except Exception as e:
-            ti = f"主升浪清單生成失敗：{e}"
-        parts.append(ti)
+            parts.append(f"主升浪清單生成失敗：{e}")
     else:
         parts.append("（虛擬貨幣模組已關閉）")
 
@@ -417,7 +399,6 @@ def compose_report(phase: str) -> str:
 
 # ========= 排程 =========
 sched = BackgroundScheduler(timezone=str(TZ))
-
 def _safe_compose(phase: str) -> str:
     try: return compose_report(phase)
     except Exception as e: return f"【{phase}報】生成失敗：{e}"
@@ -456,7 +437,6 @@ def watch_keeper():
 def start_sched():
     if not sched.running: sched.start()
 
-# ========= 其他管理 =========
 @app.get("/admin/news-score")
 def admin_news_score(symbol: str = "BTC"):
     s = news_scoring.get_news_score(symbol.upper())
@@ -464,4 +444,4 @@ def admin_news_score(symbol: str = "BTC"):
 
 @app.get("/admin/health")
 def admin_health():
-    return {"ok": True, "tag": "v8R5", "ts": int(time.time())}
+    return {"ok": True, "tag": "v8R6", "ts": int(time.time())}
