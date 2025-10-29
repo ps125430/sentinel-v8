@@ -1,12 +1,13 @@
 # =========================
-# app/main.py 〔覆蓋版・一鍵貼上 R6〕
-# 新增：台股模組（tw_stocks），可開關；報表早/午/晚顯示台股區塊
+# app/main.py 〔覆蓋版・一鍵貼上 v8R6-TW-HOTFIX〕
+# 新增：台股模組（tw_stocks）可開關；報表早/午/晚顯示台股區塊
+# 修正：state_store.save_state() 無參數簽名相容（_persist）
 # 內建：/admin/env-lite、/admin/ping-services、/admin/version-*
-# ＊所有回覆加「【v8R6】」指紋；logs 帶 [WH][v8R6]/[PUSH][v8R6]
+# ＊所有回覆加「【v8R6-TW】」指紋；logs 帶 [WH][v8R6-TW]/[PUSH][v8R6-TW]
 # =========================
 
 from __future__ import annotations
-import os, re, time, json, hashlib
+import os, re, time, json, hashlib, inspect
 from zoneinfo import ZoneInfo
 from typing import Dict, Any, Tuple
 from fastapi import FastAPI, Request
@@ -18,7 +19,26 @@ from app.services import watches as W
 from app import trend_integrator, news_scoring
 from app import us_stocks, us_news
 from app import badges_radar
-from app import tw_stocks  # ★ 新增
+from app import tw_stocks  # ★ 台股模組
+
+# ======= save_state 相容層（重點 hotfix）=======
+try:
+    _SAVE_WANTS_ARG = len(inspect.signature(save_state).parameters) >= 1
+except Exception:
+    _SAVE_WANTS_ARG = False
+
+def _persist(st=None):
+    """相容不同簽名的 save_state：優先無參數；必要時帶參數。"""
+    try:
+        if _SAVE_WANTS_ARG and st is not None:
+            save_state(st)  # type: ignore
+        else:
+            save_state()
+    except TypeError:
+        try: save_state()
+        except Exception as e: print("[STATE] save_state failed:", e)
+    except Exception as e:
+        print("[STATE] save_state failed:", e)
 
 # ======= 版本差異 fallback（沿用 R5）=======
 BASELINE_PATH = "/tmp/sentinel-v8.version-prev.json"
@@ -35,8 +55,7 @@ def _iter_files(root: str):
                 p = os.path.join(dirpath, fn)
                 try:
                     size = os.path.getsize(p)
-                    if size > 262_144:
-                        continue
+                    if size > 262_144: continue
                 except Exception:
                     continue
                 yield p
@@ -46,8 +65,7 @@ def _fingerprint(path: str) -> Tuple[int, int, str]:
         st = os.stat(path)
         size, mtime = int(st.st_size), int(st.st_mtime)
         h = hashlib.sha1()
-        with open(path, "rb") as f:
-            h.update(f.read())
+        with open(path, "rb") as f: h.update(f.read())
         return size, mtime, h.hexdigest()[:8]
     except Exception:
         return 0, 0, ""
@@ -58,22 +76,18 @@ def _snapshot(root: str) -> Dict[str, Any]:
     for p in _iter_files(root):
         rp = os.path.relpath(p, root)
         size, mtime, sh = _fingerprint(p)
-        if sh:
-            items[rp] = {"size": size, "mtime": mtime, "sha": sh}
+        if sh: items[rp] = {"size": size, "mtime": mtime, "sha": sh}
     return {"root": root, "ts": int(time.time()), "items": items}
 
 def _diff(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
     A, B = a.get("items", {}), b.get("items", {})
     add, delete, modify = [], [], []
     for k in B:
-        if k not in A:
-            add.append(k)
+        if k not in A: add.append(k)
         else:
-            if A[k].get("sha") != B[k].get("sha"):
-                modify.append(k)
+            if A[k].get("sha") != B[k].get("sha"): modify.append(k)
     for k in A:
-        if k not in B:
-            delete.append(k)
+        if k not in B: delete.append(k)
     return {"add": sorted(add), "delete": sorted(delete), "modify": sorted(modify)}
 
 def _mk_summary(delta: Dict[str, Any], limit: int = 10) -> str:
@@ -118,8 +132,7 @@ class _VersionDiffFallback:
 
 try:
     from app.services import version_diff as version_diff  # type: ignore
-    if version_diff is None:
-        raise ImportError("version_diff None")
+    if version_diff is None: raise ImportError("version_diff None")
 except Exception:
     version_diff = _VersionDiffFallback()  # type: ignore
 
@@ -140,36 +153,36 @@ def ensure_prefs_defaults():
     prefs = st.setdefault("prefs", {})
     prefs.setdefault("enable_us", True)
     prefs.setdefault("enable_crypto", True)
-    prefs.setdefault("enable_tw", True)  # ★ 新增：台股
-    save_state(st)
+    prefs.setdefault("enable_tw", True)  # ★ 台股
+    _persist(st)  # 相容存檔
     return prefs
 
 # ========= 啟動 =========
 @app.on_event("startup")
 def on_startup():
-    print("[BOOT][v8R6] starting…")
-    _ = get_state(); save_state()
+    print("[BOOT][v8R6-TW] starting…")
+    _ = get_state(); _persist()
     ensure_prefs_defaults()
     try:
         badges_radar.refresh_badges()
-        print("[BOOT][v8R6] badges refreshed")
+        print("[BOOT][v8R6-TW] badges refreshed")
     except Exception as e:
-        print("[BOOT][v8R6] badges init err:", e)
+        print("[BOOT][v8R6-TW] badges init err:", e)
     try:
         if not os.path.exists(BASELINE_PATH):
             version_diff.checkpoint_now(".")
-            print("[BOOT][v8R6] version baseline created")
+            print("[BOOT][v8R6-TW] version baseline created")
     except Exception as e:
-        print("[BOOT][v8R6] version baseline err:", e)
+        print("[BOOT][v8R6-TW] version baseline err:", e)
 
 # ========= 管理/診斷 =========
 @app.get("/")
 def root():
-    return {"ok": True, "tag": "v8R6", "ts": int(time.time())}
+    return {"ok": True, "tag": "v8R6-TW", "ts": int(time.time())}
 
 @app.get("/admin/env-lite")
 def env_lite():
-    return {"tag": "v8R6", "has_line_token": bool(LINE_ACCESS_TOKEN), "has_push_target": bool(LINE_PUSH_TO)}
+    return {"tag": "v8R6-TW", "has_line_token": bool(LINE_ACCESS_TOKEN), "has_push_target": bool(LINE_PUSH_TO)}
 
 @app.get("/admin/ping-services")
 def ping_services():
@@ -208,20 +221,20 @@ def admin_version_badge():
 
 # ========= 推播封裝 =========
 def push_to_line(text: str):
-    msg = f"【v8R6】{text}"
+    msg = f"【v8R6-TW】{text}"
     if line_bot_api and LINE_PUSH_TO:
         try:
             line_bot_api.push_message(LINE_PUSH_TO, TextSendMessage(msg))
-            print("[PUSH][v8R6] sent to LINE_PUSH_TO"); return
+            print("[PUSH][v8R6-TW] sent to LINE_PUSH_TO"); return
         except Exception as e:
-            print(f"[PUSH][v8R6] error:", e)
-    print("[PUSH][v8R6] console:", msg)
+            print(f"[PUSH][v8R6-TW] error:", e)
+    print("[PUSH][v8R6-TW] console:", msg)
 
 # ========= LINE Webhook =========
 @app.post("/line/webhook")
 async def line_webhook(request: Request):
     payload = await request.json()
-    print("[WH][v8R6] inbound:", json.dumps(payload, ensure_ascii=False)[:400])
+    print("[WH][v8R6-TW] inbound:", json.dumps(payload, ensure_ascii=False)[:400])
     events = payload.get("events", [])
     out = []
 
@@ -229,17 +242,17 @@ async def line_webhook(request: Request):
         raw = (ev.get("message", {}) or {}).get("text", "") or ""
         reply_token = ev.get("replyToken")
         t = re.sub(r"\s+", " ", raw.replace("\u3000", " ")).strip()
-        print(f"[WH][v8R6] text='{t}' reply_token={'Y' if reply_token else 'N'}")
+        print(f"[WH][v8R6-TW] text='{t}' reply_token={'Y' if reply_token else 'N'}")
 
         def reply(msg: str):
-            tagged = f"【v8R6】{msg}"
+            tagged = f"【v8R6-TW】{msg}"
             out.append(tagged)
             if line_bot_api and reply_token:
                 try:
                     line_bot_api.reply_message(reply_token, TextSendMessage(tagged))
-                    print("[WH][v8R6] replied via Reply API")
+                    print("[WH][v8R6-TW] replied via Reply API")
                 except Exception as e:
-                    print("[WH][v8R6] reply error:", e)
+                    print("[WH][v8R6-TW] reply error:", e)
 
         # === 模組開關（美股 / 台股 / 虛擬貨幣）===
         m_toggle = re.match(r"^(美股|台股|虛擬貨幣)\s*(開啟|關閉)$", t)
@@ -247,7 +260,7 @@ async def line_webhook(request: Request):
             mod, act = m_toggle.groups()
             key = {"美股":"enable_us","台股":"enable_tw","虛擬貨幣":"enable_crypto"}[mod]
             val = (act == "開啟")
-            st = get_state(); st.setdefault("prefs", {})[key] = val; save_state(st)
+            st = get_state(); st.setdefault("prefs", {})[key] = val; _persist(st)
             prefs = st["prefs"]
             reply(f"{mod} 已{act}。目前：美股={'開' if prefs.get('enable_us') else '關'}｜台股={'開' if prefs.get('enable_tw') else '關'}｜幣圈={'開' if prefs.get('enable_crypto') else '關'}")
             continue
@@ -444,4 +457,4 @@ def admin_news_score(symbol: str = "BTC"):
 
 @app.get("/admin/health")
 def admin_health():
-    return {"ok": True, "tag": "v8R6", "ts": int(time.time())}
+    return {"ok": True, "tag": "v8R6-TW", "ts": int(time.time())}
