@@ -1,0 +1,19 @@
+name: Wake Render before reports
+
+on:
+  schedule:
+    # 台北時間 -5 分鐘：09:25 / 12:25 / 17:55 / 22:25
+    # 轉 UTC：01:25 / 04:25 / 09:55 / 14:25
+    - cron: "25 1 * * *"
+    - cron: "25 4 * * *"
+    - cron: "55 9 * * *"
+    - cron: "25 14 * * *"
+  workflow_dispatch:
+
+jobs:
+  wake:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Warm up
+        run: |
+          curl -fsSL "$RENDER_URL/admin/warm?token=$WAKER_TOKEN" || true
