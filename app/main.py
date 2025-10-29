@@ -1,9 +1,9 @@
 # =========================
-# app/main.py 〔覆蓋版・一鍵貼上 v8R6-TW-HOTFIX〕
-# 新增：台股模組（tw_stocks）可開關；報表早/午/晚顯示台股區塊
-# 修正：state_store.save_state() 無參數簽名相容（_persist）
-# 內建：/admin/env-lite、/admin/ping-services、/admin/version-*
-# ＊所有回覆加「【v8R6-TW】」指紋；logs 帶 [WH][v8R6-TW]/[PUSH][v8R6-TW]
+# app/main.py 〔覆蓋版・一鍵貼上 v8R7-TWNEWS〕
+# Sentinel v8 · FastAPI + APScheduler + LINE Reply
+# 新增：台股新聞（tw_news）；早/午報自動附台股新聞；LINE 指令「台股新聞」
+# 內建：save_state 相容層、版本核對 API、台股/美股/幣圈開關、台股三行分組
+# ＊所有回覆加「【v8R7-TWNEWS】」
 # =========================
 
 from __future__ import annotations
@@ -19,16 +19,16 @@ from app.services import watches as W
 from app import trend_integrator, news_scoring
 from app import us_stocks, us_news
 from app import badges_radar
-from app import tw_stocks  # ★ 台股模組
+from app import tw_stocks
+from app import tw_news   # ★ 新增
 
-# ======= save_state 相容層（重點 hotfix）=======
+# ======= save_state 相容層 =======
 try:
     _SAVE_WANTS_ARG = len(inspect.signature(save_state).parameters) >= 1
 except Exception:
     _SAVE_WANTS_ARG = False
 
 def _persist(st=None):
-    """相容不同簽名的 save_state：優先無參數；必要時帶參數。"""
     try:
         if _SAVE_WANTS_ARG and st is not None:
             save_state(st)  # type: ignore
@@ -40,7 +40,7 @@ def _persist(st=None):
     except Exception as e:
         print("[STATE] save_state failed:", e)
 
-# ======= 版本差異 fallback（沿用 R5）=======
+# ======= 版本差異 fallback =======
 BASELINE_PATH = "/tmp/sentinel-v8.version-prev.json"
 SCAN_ROOT = "."
 
@@ -153,36 +153,36 @@ def ensure_prefs_defaults():
     prefs = st.setdefault("prefs", {})
     prefs.setdefault("enable_us", True)
     prefs.setdefault("enable_crypto", True)
-    prefs.setdefault("enable_tw", True)  # ★ 台股
-    _persist(st)  # 相容存檔
+    prefs.setdefault("enable_tw", True)  # 台股
+    _persist(st)
     return prefs
 
 # ========= 啟動 =========
 @app.on_event("startup")
 def on_startup():
-    print("[BOOT][v8R6-TW] starting…")
+    print("[BOOT][v8R7-TWNEWS] starting…")
     _ = get_state(); _persist()
     ensure_prefs_defaults()
     try:
         badges_radar.refresh_badges()
-        print("[BOOT][v8R6-TW] badges refreshed")
+        print("[BOOT][v8R7-TWNEWS] badges refreshed")
     except Exception as e:
-        print("[BOOT][v8R6-TW] badges init err:", e)
+        print("[BOOT][v8R7-TWNEWS] badges init err:", e)
     try:
         if not os.path.exists(BASELINE_PATH):
             version_diff.checkpoint_now(".")
-            print("[BOOT][v8R6-TW] version baseline created")
+            print("[BOOT][v8R7-TWNEWS] version baseline created")
     except Exception as e:
-        print("[BOOT][v8R6-TW] version baseline err:", e)
+        print("[BOOT][v8R7-TWNEWS] version baseline err:", e)
 
 # ========= 管理/診斷 =========
 @app.get("/")
 def root():
-    return {"ok": True, "tag": "v8R6-TW", "ts": int(time.time())}
+    return {"ok": True, "tag": "v8R7-TWNEWS", "ts": int(time.time())}
 
 @app.get("/admin/env-lite")
 def env_lite():
-    return {"tag": "v8R6-TW", "has_line_token": bool(LINE_ACCESS_TOKEN), "has_push_target": bool(LINE_PUSH_TO)}
+    return {"tag": "v8R7-TWNEWS", "has_line_token": bool(LINE_ACCESS_TOKEN), "has_push_target": bool(LINE_PUSH_TO)}
 
 @app.get("/admin/ping-services")
 def ping_services():
@@ -193,9 +193,10 @@ def ping_services():
             return False, str(e)
     ok_prefs, err_prefs = check("app.services.prefs")
     ok_watches, err_watches = check("app.services.watches")
-    ok_tw, err_tw       = check("app.tw_stocks")
-    return {"ok": {"prefs": ok_prefs, "watches": ok_watches, "tw_stocks": ok_tw},
-            "errors": {"prefs": err_prefs, "watches": err_watches, "tw_stocks": err_tw}}
+    ok_tw, err_tw = check("app.tw_stocks")
+    ok_tn, err_tn = check("app.tw_news")
+    return {"ok": {"prefs": ok_prefs, "watches": ok_watches, "tw_stocks": ok_tw, "tw_news": ok_tn},
+            "errors": {"prefs": err_prefs, "watches": err_watches, "tw_stocks": err_tw, "tw_news": err_tn}}
 
 @app.post("/admin/version-snapshot")
 def admin_version_snapshot():
@@ -221,20 +222,20 @@ def admin_version_badge():
 
 # ========= 推播封裝 =========
 def push_to_line(text: str):
-    msg = f"【v8R6-TW】{text}"
+    msg = f"【v8R7-TWNEWS】{text}"
     if line_bot_api and LINE_PUSH_TO:
         try:
             line_bot_api.push_message(LINE_PUSH_TO, TextSendMessage(msg))
-            print("[PUSH][v8R6-TW] sent to LINE_PUSH_TO"); return
+            print("[PUSH][v8R7-TWNEWS] sent to LINE_PUSH_TO"); return
         except Exception as e:
-            print(f"[PUSH][v8R6-TW] error:", e)
-    print("[PUSH][v8R6-TW] console:", msg)
+            print(f"[PUSH][v8R7-TWNEWS] error:", e)
+    print("[PUSH][v8R7-TWNEWS] console:", msg)
 
 # ========= LINE Webhook =========
 @app.post("/line/webhook")
 async def line_webhook(request: Request):
     payload = await request.json()
-    print("[WH][v8R6-TW] inbound:", json.dumps(payload, ensure_ascii=False)[:400])
+    print("[WH][v8R7-TWNEWS] inbound:", json.dumps(payload, ensure_ascii=False)[:400])
     events = payload.get("events", [])
     out = []
 
@@ -242,17 +243,17 @@ async def line_webhook(request: Request):
         raw = (ev.get("message", {}) or {}).get("text", "") or ""
         reply_token = ev.get("replyToken")
         t = re.sub(r"\s+", " ", raw.replace("\u3000", " ")).strip()
-        print(f"[WH][v8R6-TW] text='{t}' reply_token={'Y' if reply_token else 'N'}")
+        print(f"[WH][v8R7-TWNEWS] text='{t}' reply_token={'Y' if reply_token else 'N'}")
 
         def reply(msg: str):
-            tagged = f"【v8R6-TW】{msg}"
+            tagged = f"【v8R7-TWNEWS】{msg}"
             out.append(tagged)
             if line_bot_api and reply_token:
                 try:
                     line_bot_api.reply_message(reply_token, TextSendMessage(tagged))
-                    print("[WH][v8R6-TW] replied via Reply API")
+                    print("[WH][v8R7-TWNEWS] replied via Reply API")
                 except Exception as e:
-                    print("[WH][v8R6-TW] reply error:", e)
+                    print("[WH][v8R7-TWNEWS] reply error:", e)
 
         # === 模組開關（美股 / 台股 / 虛擬貨幣）===
         m_toggle = re.match(r"^(美股|台股|虛擬貨幣)\s*(開啟|關閉)$", t)
@@ -311,6 +312,12 @@ async def line_webhook(request: Request):
                 reply("台股模組目前關閉。可用：『台股 開啟』"); continue
             reply(tw_stocks.format_tw_full()); continue
 
+        # 台股新聞（中文）
+        if t in ("台股新聞", "台灣股市新聞", "TW 新聞"):
+            if not get_state().get("prefs", {}).get("enable_tw", True):
+                reply("台股模組目前關閉。可用：『台股 開啟』"); continue
+            reply(tw_news.format_tw_news_block(k=5)); continue
+
         # 監控延長 + / 停止 -
         sym = W.parse_plus(t)
         if sym: reply(W.extend(sym, hours=1)); continue
@@ -356,11 +363,11 @@ async def line_webhook(request: Request):
             reply(f"{sym} 設定為{action}，並已監控 1 小時。"); continue
 
         # 預設回覆
-        reply("指令：台股｜美股｜今日強勢｜今日弱勢｜新聞 <幣>｜顏色 台股/美股｜總覽｜版本核對｜版本差異｜模組狀態｜（美股/台股/虛擬貨幣）開啟/關閉")
+        reply("指令：台股｜台股新聞｜美股｜今日強勢｜今日弱勢｜新聞 <幣>｜顏色 台股/美股｜總覽｜版本核對｜版本差異｜模組狀態｜（美股/台股/虛擬貨幣）開啟/關閉")
 
     return {"messages": out}
 
-# ========= 報表（四時段；台股在早/午/晚）=========
+# ========= 報表（四時段；台股三行分組＋早/午台股新聞）=========
 def compose_report(phase: str) -> str:
     prefs = ensure_prefs_defaults()
     scheme = current_scheme()
@@ -377,12 +384,17 @@ def compose_report(phase: str) -> str:
 
     parts = [f"【{phase}報】配色：{scheme}{badge_str}", f"監控：{W.summarize()}", ""]
 
-    # 台股：早/午/晚顯示
+    # 台股：早/午/晚顯示三行分組；且早/午附台股新聞
     if prefs.get("enable_tw", True) and phase in ("morning","noon","evening"):
         try:
             parts += [tw_stocks.format_tw_block(phase=phase), ""]
         except Exception as e:
             parts += [f"台股區塊生成失敗：{e}", ""]
+        if phase in ("morning","noon"):
+            try:
+                parts += [tw_news.format_tw_news_block(k=3), ""]
+            except Exception as e:
+                parts += [f"台股新聞取得失敗：{e}", ""]
 
     # 美股：夜＝開盤雷達＋新聞；早＝隔夜回顧
     if prefs.get("enable_us", True):
@@ -457,4 +469,4 @@ def admin_news_score(symbol: str = "BTC"):
 
 @app.get("/admin/health")
 def admin_health():
-    return {"ok": True, "tag": "v8R6-TW", "ts": int(time.time())}
+    return {"ok": True, "tag": "v8R7-TWNEWS", "ts": int(time.time())}
