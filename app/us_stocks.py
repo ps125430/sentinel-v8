@@ -1,83 +1,61 @@
+# app/us_stocks.py 〔v8R7〕
+# 美股雷達：Stooq/或現行資料源 → 三行分組 & 詳細清單；支援 show_price
 from __future__ import annotations
-import csv, io, urllib.request
-from typing import Dict, List
+import math
+import requests
 
-STQ_FMT = "https://stooq.com/q/l/?s={tickers}&f=sd2t2ohlcv&h&e=csv"
+US_SYMBOLS = ["NVDA","MSFT","AAPL","AMZN","GOOGL","META","TSLA","INTC","AMD","PLTR"]
 
-CORE_TICKERS = [
-    "nvda.us", "msft.us", "aapl.us", "amzn.us", "googl.us",
-    "meta.us", "tsla.us", "intc.us", "amd.us", "pltr.us"
-]
-
-NAME_MAP = {
-    "nvda.us": "NVDA",
-    "msft.us": "MSFT",
-    "aapl.us": "AAPL",
-    "amzn.us": "AMZN",
-    "googl.us": "GOOGL",
-    "meta.us": "META",
-    "tsla.us": "TSLA",
-    "intc.us": "INTC",
-    "amd.us": "AMD",
-    "pltr.us": "PLTR",
-}
-
-def _fetch_stooq(tickers: List[str]) -> Dict[str, Dict]:
-    url = STQ_FMT.format(tickers=",".join(tickers))
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        data = resp.read().decode("utf-8", errors="ignore")
-    rdr = csv.DictReader(io.StringIO(data))
-    out: Dict[str, Dict] = {}
-    for row in rdr:
-        sym = (row.get("Symbol") or "").lower()
-        try:
-            close = float(row.get("Close") or 0)
-            openp = float(row.get("Open") or 0)
-        except Exception:
-            continue
-        chg = 0.0
-        if openp > 0:
-            chg = (close - openp) / openp * 100.0
-        out[sym] = {"symbol": NAME_MAP.get(sym, sym.upper()), "chg": round(chg, 2)}
+# 這裡示範用 Yahoo quote（免金鑰）；你原本若有 stooq 可保留原邏輯，回傳結構一致即可
+def _yahoo_quote(symbols: list[str]) -> list[dict]:
+    url = "https://query1.finance.yahoo.com/v7/finance/quote"
+    q = ",".join(symbols)
+    r = requests.get(url, params={"symbols": q}, timeout=10)
+    r.raise_for_status()
+    data = r.json().get("quoteResponse", {}).get("result", [])
+    out = []
+    for d in data:
+        sym = d.get("symbol", "")
+        price = d.get("regularMarketPrice")
+        pct = d.get("regularMarketChangePercent")
+        name = d.get("shortName") or sym
+        out.append({"symbol": sym, "name": name, "price": price, "pct": pct})
     return out
 
-def _risk_on_score(data: Dict[str, Dict]) -> int:
-    if not data:
-        return 50
-    avg = sum([v["chg"] for v in data.values()]) / len(data)
-    score = 50 + avg * 10  # ±2% -> ±20 分
-    return max(0, min(100, int(round(score))))
+def _fmt_pct(p):
+    if p is None or (isinstance(p, float) and math.isnan(p)):
+        return "—"
+    return f"{p:+.1f}%"
 
-def format_us_block(phase: str = "night") -> str:
-    """夜報/早報：三行分組（每行 3–4 檔），手機閱讀最順。"""
-    q = _fetch_stooq(CORE_TICKERS)
-    if not q:
-        return "美股觀測：暫時無法取得行情資料。"
+def _fmt_price(p):
+    if p is None or (isinstance(p, float) and math.isnan(p)):
+        return "—"
+    # 美股不加貨幣符號，避免與幅度混淆；由上層加
+    return f"{p:.2f}".rstrip("0").rstrip(".")
 
-    risk = _risk_on_score(q)
-    # 依固定順序輸出
-    ordered = []
-    for t in CORE_TICKERS:
-        if t in q:
-            v = q[t]
-            ordered.append(f"{v['symbol']} {v['chg']:+.2f}%")
+def _group_three_lines(rows: list[dict], show_price: bool) -> str:
+    # 三行分組（3+3+4）
+    line1 = rows[0:3]; line2 = rows[3:6]; line3 = rows[6:10]
+    def cell(r):
+        base = f'{r["symbol"]} {_fmt_pct(r["pct"])}'
+        if show_price:
+            base = f'{base}（{_fmt_price(r["price"])}）'
+        return base
+    def join(lst): return "｜".join(cell(r) for r in lst if r.get("pct") is not None)
+    return "\n".join([s for s in [join(line1), join(line2), join(line3)] if s])
 
-    groups = [ordered[0:3], ordered[3:6], ordered[6:10]]
-    grouped_lines = "\n".join("｜".join(g) for g in groups if g)
+def format_us_block(phase: str = "night", show_price: bool = True) -> str:
+    rows = _yahoo_quote(US_SYMBOLS)
+    header = "📈 美股開盤雷達" if phase == "night" else "📈 美股隔夜回顧"
+    tri = _group_three_lines(rows, show_price=show_price)
+    return f"{header}\n{tri}"
 
-    title = "📈 美股開盤雷達" if phase == "night" else "🌙 隔夜美股回顧"
-    return f"{title}｜Risk-On：{risk}\n{grouped_lines}"
-
-def format_us_full() -> str:
-    """指令用詳細版：逐檔一行，便於複製與細看。"""
-    q = _fetch_stooq(CORE_TICKERS)
-    if not q:
-        return "美股觀測：暫時無法取得行情資料。"
-    risk = _risk_on_score(q)
-    lines = [f"📊 美股十巨頭｜Risk-On：{risk}"]
-    for t in CORE_TICKERS:
-        if t in q:
-            v = q[t]
-            lines.append(f"{v['symbol']}: {v['chg']:+.2f}%")
+def format_us_full(show_price: bool = True) -> str:
+    rows = _yahoo_quote(US_SYMBOLS)
+    lines = ["📈 美股觀察清單（十巨頭）"]
+    for r in rows:
+        if show_price:
+            lines.append(f"{r['symbol']} {_fmt_pct(r['pct'])}（{_fmt_price(r['price'])}）")
+        else:
+            lines.append(f"{r['symbol']} {_fmt_pct(r['pct'])}")
     return "\n".join(lines)
