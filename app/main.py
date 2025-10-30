@@ -1,15 +1,16 @@
 # =========================
-# app/main.py 〔覆蓋版・v8R7｜顯示價格可開關〕
-# 新增：LINE 指令「顯示價格 開啟｜關閉」
-# 台股/美股報表與詳細指令依 prefs.show_price 顯示價格
-# 幣圈：在「今日強勢/今日弱勢」中（若開啟）盡力附上 $價格（抓不到則略過）
-# ＊所有回覆帶【v8R7】
+# app/main.py 〔覆蓋版・v8R7-HF｜限流快取保命〕
+# 變更重點：
+# - 對 trend_integrator.generate_side / generate_report 加「兩次快速重試 + 60s 快取 + 失敗回退」
+# - 排程與 LINE 指令「今日強勢／今日弱勢」都走同一套保命流程
+# - 其餘維持 v8R7 行為（顯示價格、台/美股區塊、版本核對、手動重發四報）
+# ＊所有回覆帶【v8R7-HF】
 # =========================
 
 from __future__ import annotations
 import os, re, time, json, hashlib, inspect
 from zoneinfo import ZoneInfo
-from typing import Dict, Any, Tuple, List
+from typing import Dict, Any, Tuple, List, Optional
 from fastapi import FastAPI, Request, HTTPException
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -19,14 +20,13 @@ from app.services import watches as W
 from app import trend_integrator, news_scoring
 from app import us_stocks, us_news
 from app import badges_radar
-from app import tw_stocks  # 台股
-# 可選：若有台股新聞模組就載入；沒有也不影響
+from app import tw_stocks
 try:
     from app import tw_news
 except Exception:
     tw_news = None  # type: ignore
 
-# ======= save_state 相容層（無論舊版/新版簽名都可用）=======
+# ===== save_state 相容層 =====
 import inspect as _ins
 try:
     _SAVE_WANTS_ARG = len(_ins.signature(save_state).parameters) >= 1
@@ -45,7 +45,7 @@ def _persist(st=None):
     except Exception as e:
         print("[STATE] save_state failed:", e)
 
-# ======= 版本差異 fallback =======
+# ===== 版本差異 fallback =====
 BASELINE_PATH = "/tmp/sentinel-v8.version-prev.json"
 SCAN_ROOT = "."
 
@@ -68,8 +68,7 @@ def _iter_files(root: str):
 import hashlib as _hl
 def _fingerprint(path: str) -> Tuple[int, int, str]:
     try:
-        st = os.stat(path)
-        size, mtime = int(st.st_size), int(st.st_mtime)
+        st = os.stat(path); size, mtime = int(st.st_size), int(st.st_mtime)
         h = _hl.sha1()
         with open(path, "rb") as f: h.update(f.read())
         return size, mtime, h.hexdigest()[:8]
@@ -153,68 +152,131 @@ LINE_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_PUSH_TO = os.getenv("LINE_PUSH_TO", "")
 line_bot_api = LineBotApi(LINE_ACCESS_TOKEN) if LINE_ACCESS_TOKEN else None
 
-# ===== 喚醒與觸發安全：Token =====
+# ===== Token 驗證（喚醒/觸發）=====
 WAKER_TOKEN = os.getenv("WAKER_TOKEN", "")
-
 def _chk_token(token: str):
     if not WAKER_TOKEN or token != WAKER_TOKEN:
         raise HTTPException(status_code=401, detail="bad token")
 
-# ========= 偏好開關（含顯示價格） =========
+# ========= 偏好開關 =========
 def ensure_prefs_defaults():
     st = get_state()
     prefs = st.setdefault("prefs", {})
     prefs.setdefault("enable_us", True)
     prefs.setdefault("enable_crypto", True)
     prefs.setdefault("enable_tw", True)
-    prefs.setdefault("show_price", True)  # ★ 新增：顯示價格預設開啟
+    prefs.setdefault("show_price", True)
     st.setdefault("manual_push_ts", {})
+    st.setdefault("cache", {})  # ★ for trend cache
     _persist(st)
     return prefs
 
-# ========= 推播封裝 =========
+# ========= 推播 =========
 def push_to_line(text: str):
-    msg = f"【v8R7】{text}"
+    msg = f"【v8R7-HF】{text}"
     if line_bot_api and LINE_PUSH_TO:
         try:
             line_bot_api.push_message(LINE_PUSH_TO, TextSendMessage(msg))
-            print("[PUSH][v8R7] sent to LINE_PUSH_TO"); return
+            print("[PUSH][v8R7-HF] sent"); return
         except Exception as e:
-            print(f"[PUSH][v8R7] error:", e)
-    print("[PUSH][v8R7] console:", msg)
+            print(f"[PUSH][v8R7-HF] error:", e)
+    print("[PUSH][v8R7-HF] console:", msg)
+
+# ========= 趨勢區塊：重試 + 快取 + 回退 =========
+def _cache_get(key: str) -> Optional[Dict[str, Any]]:
+    st = get_state(); c = st.get("cache", {})
+    v = c.get(key); 
+    return v if isinstance(v, dict) else None
+
+def _cache_put(key: str, text: str, ttl_sec: int):
+    st = get_state(); c = st.setdefault("cache", {})
+    c[key] = {"text": text, "ts": int(time.time()), "ttl": int(ttl_sec)}
+    _persist(st)
+
+def _cache_alive(rec: Dict[str, Any], now: int) -> bool:
+    ts, ttl = int(rec.get("ts", 0)), int(rec.get("ttl", 0))
+    return (now - ts) <= ttl
+
+def _safe_trend_side(single_label: str, scheme: str, want_strong: bool, topn: int = 3, ttl: int = 60) -> str:
+    """
+    產生「今日強勢/弱勢」訊息，帶兩次快速重試與 60s 快取。
+    """
+    key = f"trend_side::{single_label}::{scheme}::{topn}"
+    now = int(time.time())
+
+    # 1) 先試即時（最多兩次）
+    last_err = None
+    for i in range(2):
+        try:
+            msg = trend_integrator.generate_side(single=single_label, scheme=scheme, want_strong=want_strong, topn=topn)
+            _cache_put(key, msg, ttl)
+            return msg
+        except Exception as e:
+            last_err = e
+            time.sleep(0.8)  # 小退避
+
+    # 2) 即時失敗 → 快取回退
+    rec = _cache_get(key)
+    if rec and _cache_alive(rec, now):
+        age = now - int(rec.get("ts", 0))
+        return f"⚠️ 資料源限流，使用最近快取（{age}s 前）\n{rec.get('text','')}"
+
+    # 3) 再回退：舊快取（過期也用）
+    if rec:
+        age = now - int(rec.get("ts", 0))
+        return f"⚠️ 資料源限流，回退舊快取（{age}s 前，已過期）\n{rec.get('text','')}"
+
+    # 4) 無任何可用 → 明確錯誤
+    raise last_err or RuntimeError("trend side unavailable")
+
+def _safe_trend_report(scheme: str, topn: int = 3, ttl: int = 60) -> str:
+    key = f"trend_report::{scheme}::{topn}"
+    now = int(time.time())
+    last_err = None
+    for i in range(2):
+        try:
+            msg = trend_integrator.generate_report(scheme=scheme, topn=topn)
+            _cache_put(key, msg, ttl)
+            return msg
+        except Exception as e:
+            last_err = e
+            time.sleep(0.8)
+    rec = _cache_get(key)
+    if rec and _cache_alive(rec, now):
+        age = now - int(rec.get("ts", 0))
+        return f"⚠️ 資料源限流，使用最近快取（{age}s 前）\n{rec.get('text','')}"
+    if rec:
+        age = now - int(rec.get("ts", 0))
+        return f"⚠️ 資料源限流，回退舊快取（{age}s 前，已過期）\n{rec.get('text','')}"
+    return "⚠️ 資料源限流，稍後再試（目前無可用快取）"
 
 # ========= 啟動 =========
 @app.on_event("startup")
 def on_startup():
-    print("[BOOT][v8R7] starting…")
+    print("[BOOT][v8R7-HF] starting…")
     _ = get_state(); _persist()
     ensure_prefs_defaults()
     try:
         badges_radar.refresh_badges()
-        print("[BOOT][v8R7] badges refreshed")
+        print("[BOOT][v8R7-HF] badges refreshed")
     except Exception as e:
-        print("[BOOT][v8R7] badges init err:", e)
+        print("[BOOT][v8R7-HF] badges init err:", e)
     try:
         if not os.path.exists(BASELINE_PATH):
             version_diff.checkpoint_now(".")
-            print("[BOOT][v8R7] version baseline created")
+            print("[BOOT][v8R7-HF] version baseline created")
     except Exception as e:
-        print("[BOOT][v8R7] version baseline err:", e)
+        print("[BOOT][v8R7-HF] version baseline err:", e)
 
 # ========= 管理/診斷 =========
 @app.get("/")
 def root():
-    return {"ok": True, "tag": "v8R7", "ts": int(time.time())}
+    return {"ok": True, "tag": "v8R7-HF", "ts": int(time.time())}
 
 @app.get("/admin/env-lite")
 def env_lite():
     p = get_state().get("prefs", {})
-    return {
-        "tag": "v8R7",
-        "has_line_token": bool(LINE_ACCESS_TOKEN),
-        "has_push_target": bool(LINE_PUSH_TO),
-        "prefs": p
-    }
+    return {"tag": "v8R7-HF", "has_line_token": bool(LINE_ACCESS_TOKEN), "has_push_target": bool(LINE_PUSH_TO), "prefs": p}
 
 @app.get("/admin/warm")
 def admin_warm(token: str = ""):
@@ -222,7 +284,7 @@ def admin_warm(token: str = ""):
     _ = get_state()
     try: badges_radar.refresh_badges()
     except Exception: pass
-    return {"ok": True, "tag": "v8R7", "warmed": True, "ts": int(time.time())}
+    return {"ok": True, "tag": "v8R7-HF", "warmed": True, "ts": int(time.time())}
 
 @app.post("/admin/trigger-report")
 @app.get("/admin/trigger-report")
@@ -257,14 +319,13 @@ def admin_version_badge():
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# ========= 幣價輔助（顯示價格時用；失敗就略過）=========
-# 常用幣種對應 CoinGecko id
+# ========= 幣價（只用於「今日強/弱勢」顯示美化；失敗即忽略）=========
 _CG = {
     "BTC":"bitcoin","ETH":"ethereum","SOL":"solana","BNB":"binancecoin",
     "AVAX":"avalanche-2","LINK":"chainlink","ADA":"cardano","XRP":"ripple",
-    "DOGE":"dogecoin","TON":"the-open-network","DOT":"polkadot"
+    "DOGE":"dogecoin","TON":"the-open-network","DOT":"polkadot","TRX":"tron",
+    "MATIC":"matic-network","BCH":"bitcoin-cash","LTC":"litecoin"
 }
-
 import requests
 def _get_prices_usd(symbols: List[str]) -> Dict[str, float]:
     ids = [ _CG[s] for s in symbols if s in _CG ]
@@ -277,12 +338,10 @@ def _get_prices_usd(symbols: List[str]) -> Dict[str, float]:
         )
         r.raise_for_status()
         data = r.json()
-        out = {}
-        inv = {v:k for k,v in _CG.items()}
+        out = {}; inv = {v:k for k,v in _CG.items()}
         for cg_id, obj in data.items():
             sym = inv.get(cg_id)
-            if sym and "usd" in obj:
-                out[sym] = float(obj["usd"])
+            if sym and "usd" in obj: out[sym] = float(obj["usd"])
         return out
     except Exception:
         return {}
@@ -291,7 +350,7 @@ def _get_prices_usd(symbols: List[str]) -> Dict[str, float]:
 @app.post("/line/webhook")
 async def line_webhook(request: Request):
     payload = await request.json()
-    print("[WH][v8R7] inbound:", json.dumps(payload, ensure_ascii=False)[:400])
+    print("[WH][v8R7-HF] inbound:", json.dumps(payload, ensure_ascii=False)[:400])
     events = payload.get("events", [])
     out = []
 
@@ -299,19 +358,19 @@ async def line_webhook(request: Request):
         raw = (ev.get("message", {}) or {}).get("text", "") or ""
         reply_token = ev.get("replyToken")
         t = re.sub(r"\s+", " ", raw.replace("\u3000", " ")).strip()
-        print(f"[WH][v8R7] text='{t}' reply_token={'Y' if reply_token else 'N'}")
+        print(f"[WH][v8R7-HF] text='{t}' reply_token={'Y' if reply_token else 'N'}")
 
         def reply(msg: str):
-            tagged = f"【v8R7】{msg}"
+            tagged = f"【v8R7-HF】{msg}"
             out.append(tagged)
             if line_bot_api and reply_token:
                 try:
                     line_bot_api.reply_message(reply_token, TextSendMessage(tagged))
-                    print("[WH][v8R7] replied via Reply API")
+                    print("[WH][v8R7-HF] replied")
                 except Exception as e:
-                    print("[WH][v8R7] reply error:", e)
+                    print("[WH][v8R7-HF] reply error:", e)
 
-        # === 模組開關（美股 / 台股 / 虛擬貨幣）===
+        # 模組開關
         m_toggle = re.match(r"^(美股|台股|虛擬貨幣)\s*(開啟|關閉)$", t)
         if m_toggle:
             mod, act = m_toggle.groups()
@@ -322,13 +381,12 @@ async def line_webhook(request: Request):
             reply(f"{mod} 已{act}。目前：美股={'開' if prefs.get('enable_us') else '關'}｜台股={'開' if prefs.get('enable_tw') else '關'}｜幣圈={'開' if prefs.get('enable_crypto') else '關'}")
             continue
 
-        # === 顯示價格 開啟/關閉 ===
+        # 顯示價格
         m_price = re.match(r"^顯示價格\s*(開啟|關閉)$", t)
         if m_price:
             on = (m_price.group(1) == "開啟")
             st = get_state(); st.setdefault("prefs", {})["show_price"] = on; _persist(st)
-            reply(f"顯示價格已{'開啟' if on else '關閉'}。")
-            continue
+            reply(f"顯示價格已{'開啟' if on else '關閉'}。"); continue
 
         if t in ("模組狀態", "狀態", "status"):
             prefs = get_state().get("prefs", {})
@@ -350,7 +408,7 @@ async def line_webhook(request: Request):
             reply(set_color_scheme(scheme) if scheme else "請說明要切換到「台股」或「美股」配色。")
             continue
 
-        # === 手動重發報表：早報 / 午報 / 晚報 / 夜報 ===
+        # 手動重發四報
         if t in ("早報","午報","晚報","夜報"):
             phase_map = {"早報":"morning","午報":"noon","晚報":"evening","夜報":"night"}
             ph = phase_map[t]
@@ -388,7 +446,7 @@ async def line_webhook(request: Request):
                 reply("台股模組目前關閉。可用：『台股 開啟』"); continue
             reply(tw_stocks.format_tw_full(show_price=prefs.get("show_price", True))); continue
 
-        # 監控延長 + / 停止 -
+        # 監控延長/停止
         sym = W.parse_plus(t)
         if sym: reply(W.extend(sym, hours=1)); continue
         sym = W.parse_minus(t)
@@ -398,15 +456,15 @@ async def line_webhook(request: Request):
         if t in ("總覽","監控","監控列表","監控清單"):
             reply(W.summarize()); continue
 
-        # 今日強勢/弱勢（幣圈；若開啟顯示價格則嘗試附上）
+        # 今日強勢/弱勢（走保命流程 + 可附價）
         if t in ("今日強勢", "今日弱勢"):
             prefs = get_state().get("prefs", {})
             if not prefs.get("enable_crypto", True):
                 reply("虛擬貨幣模組目前關閉。可用：『虛擬貨幣 開啟』"); continue
             scheme = current_scheme(); want_strong = (t == "今日強勢")
             try:
-                msg = trend_integrator.generate_side(single=t, scheme=scheme, want_strong=want_strong, topn=3)
-                # 如果要顯示價格→嘗試抓取
+                msg = _safe_trend_side(single_label=t, scheme=scheme, want_strong=want_strong, topn=3, ttl=60)
+                # 若開啟顯示價格 → 嘗試附價（抓不到就略過）
                 if prefs.get("show_price", True):
                     syms: List[str] = []
                     for line in msg.splitlines():
@@ -417,18 +475,15 @@ async def line_webhook(request: Request):
                     syms = sorted(set(syms))
                     prices = _get_prices_usd(syms) if syms else {}
                     if prices:
-                        # 在行尾附上價格
                         new_lines = []
                         for line in msg.splitlines():
                             m = re.search(r"\b([A-Z]{2,10})\b", line)
                             if m:
-                                s = m.group(1)
-                                p = prices.get(s)
-                                if p:
-                                    line = f"{line}（${p:,.0f}）"
+                                s = m.group(1); p = prices.get(s)
+                                if p: line = f"{line}（${p:,.0f}）"
                             new_lines.append(line)
                         msg = "\n".join(new_lines)
-                # 附加各幣 2 則中文新聞
+                # 附帶新聞（保持原有行為）
                 syms2: List[str] = []
                 for line in msg.splitlines():
                     m = re.search(r"\b([A-Z]{2,10})\b", line)
@@ -445,7 +500,7 @@ async def line_webhook(request: Request):
                             for h in heads:
                                 msg += f"\n  - {h['title_zh']} 〔{h['timeago']}〕"
             except Exception as e:
-                msg = f"{t} 生成失敗：{e}\n（外部資料源可能限流 429/451，稍後再試）"
+                msg = f"{t} 生成失敗：{e}\n（已啟用限流快取保命；稍後再試）"
             reply(msg); continue
 
         # 幣 做多/做空
@@ -460,13 +515,12 @@ async def line_webhook(request: Request):
 
     return {"messages": out}
 
-# ========= 報表（四時段；台股三行分組＋早/午可附台股新聞）=========
+# ========= 報表（四時段；幣圈走保命流程）=========
 def compose_report(phase: str) -> str:
     prefs = ensure_prefs_defaults()
     scheme = current_scheme()
     show_price = prefs.get("show_price", True)
 
-    # 徽章
     badges = []
     try: badges = badges_radar.get_badges()
     except Exception: badges = []
@@ -478,7 +532,7 @@ def compose_report(phase: str) -> str:
 
     parts = [f"【{phase}報】配色：{scheme}{badge_str}", f"監控：{W.summarize()}", ""]
 
-    # 台股：早/午/晚顯示三行分組；且早/午附台股新聞
+    # 台股
     if prefs.get("enable_tw", True) and phase in ("morning","noon","evening"):
         try:
             parts += [tw_stocks.format_tw_block(phase=phase, show_price=show_price), ""]
@@ -490,7 +544,7 @@ def compose_report(phase: str) -> str:
             except Exception as e:
                 parts += [f"台股新聞取得失敗：{e}", ""]
 
-    # 美股：夜＝開盤雷達＋新聞；早＝隔夜回顧
+    # 美股
     if prefs.get("enable_us", True):
         if phase == "night":
             try:
@@ -505,12 +559,12 @@ def compose_report(phase: str) -> str:
             except Exception as e:
                 parts += [f"美股區塊生成失敗：{e}", ""]
 
-    # 幣圈主升浪（排程報表維持趨勢重點，不強制附價）
+    # 幣圈（走保命）
     if prefs.get("enable_crypto", True):
         try:
-            parts.append(trend_integrator.generate_report(scheme=scheme, topn=3))
+            parts.append(_safe_trend_report(scheme=scheme, topn=3, ttl=60))
         except Exception as e:
-            parts.append(f"主升浪清單生成失敗：{e}")
+            parts.append(f"主升浪清單生成失敗：{e}\n（已啟用限流快取保命；稍後再試）")
     else:
         parts.append("（虛擬貨幣模組已關閉）")
 
@@ -534,11 +588,13 @@ def phase_evening(): push_to_line(_safe_compose("evening"))
 @sched.scheduled_job("cron", hour=22, minute=30)
 def phase_night():   push_to_line(_safe_compose("night"))
 
+# 每 10 分鐘刷新徽章
 @sched.scheduled_job("cron", minute="*/10", second=5)
 def badges_refresher():
     try: badges_radar.refresh_badges()
     except Exception: pass
 
+# 每分鐘：到期提醒 + 清理
 @sched.scheduled_job("cron", second=10)
 def watch_keeper():
     now = int(time.time())
@@ -563,4 +619,4 @@ def admin_news_score(symbol: str = "BTC"):
 
 @app.get("/admin/health")
 def admin_health():
-    return {"ok": True, "tag": "v8R7", "ts": int(time.time())}
+    return {"ok": True, "tag": "v8R7-HF", "ts": int(time.time())}
