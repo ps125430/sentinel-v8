@@ -1,8 +1,8 @@
 # =========================
-# app/main.py 〔覆蓋版・一鍵貼上 v8R9-WAKER〕
-# 功能：台股清單動態管理＋台股新聞＋美股/幣圈＋版本核對＋四時段報表
-# 新增：/admin/warm 喚醒、/admin/trigger-report 受控觸發（含 3 分鐘去重）
-# ＊所有回覆加「【v8R9-WAKER】」
+# app/main.py 〔覆蓋版・一鍵貼上 v8R10-MANUAL〕
+# 新增：LINE 指令「早報｜午報｜晚報｜夜報」→ 立即重發當期報表（push）
+# 保留：喚醒 / 保險觸發 / 台股清單動態管理 / 台股新聞 / 版本核對 / save_state 相容層
+# ＊所有回覆加「【v8R10-MANUAL】」
 # =========================
 
 from __future__ import annotations
@@ -148,7 +148,7 @@ LINE_PUSH_TO = os.getenv("LINE_PUSH_TO", "")
 line_bot_api = LineBotApi(LINE_ACCESS_TOKEN) if LINE_ACCESS_TOKEN else None
 
 # ===== 喚醒與觸發安全：Token =====
-WAKER_TOKEN = os.getenv("WAKER_TOKEN", "")  # GitHub Actions / 外部喚醒用
+WAKER_TOKEN = os.getenv("WAKER_TOKEN", "")
 
 def _chk_token(token: str):
     if not WAKER_TOKEN or token != WAKER_TOKEN:
@@ -161,36 +161,47 @@ def ensure_prefs_defaults():
     prefs.setdefault("enable_us", True)
     prefs.setdefault("enable_crypto", True)
     prefs.setdefault("enable_tw", True)
-    st.setdefault("manual_push_ts", {})  # 去重記錄
+    st.setdefault("manual_push_ts", {})
     _persist(st)
     return prefs
+
+# ========= 推播封裝 =========
+def push_to_line(text: str):
+    msg = f"【v8R10-MANUAL】{text}"
+    if line_bot_api and LINE_PUSH_TO:
+        try:
+            line_bot_api.push_message(LINE_PUSH_TO, TextSendMessage(msg))
+            print("[PUSH][v8R10-MANUAL] sent to LINE_PUSH_TO"); return
+        except Exception as e:
+            print(f"[PUSH][v8R10-MANUAL] error:", e)
+    print("[PUSH][v8R10-MANUAL] console:", msg)
 
 # ========= 啟動 =========
 @app.on_event("startup")
 def on_startup():
-    print("[BOOT][v8R9-WAKER] starting…")
+    print("[BOOT][v8R10-MANUAL] starting…")
     _ = get_state(); _persist()
     ensure_prefs_defaults()
     try:
         badges_radar.refresh_badges()
-        print("[BOOT][v8R9-WAKER] badges refreshed")
+        print("[BOOT][v8R10-MANUAL] badges refreshed")
     except Exception as e:
-        print("[BOOT][v8R9-WAKER] badges init err:", e)
+        print("[BOOT][v8R10-MANUAL] badges init err:", e)
     try:
         if not os.path.exists(BASELINE_PATH):
             version_diff.checkpoint_now(".")
-            print("[BOOT][v8R9-WAKER] version baseline created")
+            print("[BOOT][v8R10-MANUAL] version baseline created")
     except Exception as e:
-        print("[BOOT][v8R9-WAKER] version baseline err:", e)
+        print("[BOOT][v8R10-MANUAL] version baseline err:", e)
 
 # ========= 管理/診斷 =========
 @app.get("/")
 def root():
-    return {"ok": True, "tag": "v8R9-WAKER", "ts": int(time.time())}
+    return {"ok": True, "tag": "v8R10-MANUAL", "ts": int(time.time())}
 
 @app.get("/admin/env-lite")
 def env_lite():
-    return {"tag": "v8R9-WAKER", "has_line_token": bool(LINE_ACCESS_TOKEN), "has_push_target": bool(LINE_PUSH_TO)}
+    return {"tag": "v8R10-MANUAL", "has_line_token": bool(LINE_ACCESS_TOKEN), "has_push_target": bool(LINE_PUSH_TO)}
 
 @app.get("/admin/ping-services")
 def ping_services():
@@ -206,34 +217,24 @@ def ping_services():
     return {"ok": {"prefs": ok_prefs, "watches": ok_watches, "tw_stocks": ok_tw, "tw_news": ok_tn},
             "errors": {"prefs": err_prefs, "watches": err_watches, "tw_stocks": err_tw, "tw_news": err_tn}}
 
-# --- 喚醒：外部只要打這支就能把機器叫醒（無副作用） ---
 @app.get("/admin/warm")
 def admin_warm(token: str = ""):
     _chk_token(token)
-    # 讀一次 state + 刷徽章，讓進程與外部資源熱起來
     _ = get_state()
     try: badges_radar.refresh_badges()
     except Exception: pass
-    return {"ok": True, "tag": "v8R9-WAKER", "warmed": True, "ts": int(time.time())}
+    return {"ok": True, "tag": "v8R10-MANUAL", "warmed": True, "ts": int(time.time())}
 
-# --- 保險觸發：避免 APScheduler 睡著漏發。含 3 分鐘去重 ---
 @app.post("/admin/trigger-report")
 @app.get("/admin/trigger-report")
 def trigger_report(phase: str, token: str = ""):
     _chk_token(token)
     if phase not in ("morning","noon","evening","night"):
         raise HTTPException(400, "bad phase")
-    st = get_state()
-    mp = st.setdefault("manual_push_ts", {})
-    now = int(time.time())
-    last = int(mp.get(phase, 0))
-    if now - last < 180:  # 3 分鐘內拒絕重複
-        return {"ok": False, "skipped": True, "reason": "duplicate", "last": last}
     msg = compose_report(phase)
-    push_to_line(msg)
-    mp[phase] = now
-    _persist(st)
-    return {"ok": True, "pushed": True, "phase": phase, "ts": now}
+    push_to_line(f"🪄 手動觸發 {phase}報\n{msg}")
+    st = get_state(); st.setdefault("manual_push_ts", {})[phase] = int(time.time()); _persist(st)
+    return {"ok": True, "pushed": True, "phase": phase}
 
 @app.post("/admin/version-snapshot")
 def admin_version_snapshot():
@@ -257,22 +258,11 @@ def admin_version_badge():
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# ========= 推播封裝 =========
-def push_to_line(text: str):
-    msg = f"【v8R9-WAKER】{text}"
-    if line_bot_api and LINE_PUSH_TO:
-        try:
-            line_bot_api.push_message(LINE_PUSH_TO, TextSendMessage(msg))
-            print("[PUSH][v8R9-WAKER] sent to LINE_PUSH_TO"); return
-        except Exception as e:
-            print(f"[PUSH][v8R9-WAKER] error:", e)
-    print("[PUSH][v8R9-WAKER] console:", msg)
-
 # ========= LINE Webhook =========
 @app.post("/line/webhook")
 async def line_webhook(request: Request):
     payload = await request.json()
-    print("[WH][v8R9-WAKER] inbound:", json.dumps(payload, ensure_ascii=False)[:400])
+    print("[WH][v8R10-MANUAL] inbound:", json.dumps(payload, ensure_ascii=False)[:400])
     events = payload.get("events", [])
     out = []
 
@@ -280,17 +270,17 @@ async def line_webhook(request: Request):
         raw = (ev.get("message", {}) or {}).get("text", "") or ""
         reply_token = ev.get("replyToken")
         t = re.sub(r"\s+", " ", raw.replace("\u3000", " ")).strip()
-        print(f"[WH][v8R9-WAKER] text='{t}' reply_token={'Y' if reply_token else 'N'}")
+        print(f"[WH][v8R10-MANUAL] text='{t}' reply_token={'Y' if reply_token else 'N'}")
 
         def reply(msg: str):
-            tagged = f"【v8R9-WAKER】{msg}"
+            tagged = f"【v8R10-MANUAL】{msg}"
             out.append(tagged)
             if line_bot_api and reply_token:
                 try:
                     line_bot_api.reply_message(reply_token, TextSendMessage(tagged))
-                    print("[WH][v8R9-WAKER] replied via Reply API")
+                    print("[WH][v8R10-MANUAL] replied via Reply API")
                 except Exception as e:
-                    print("[WH][v8R9-WAKER] reply error:", e)
+                    print("[WH][v8R10-MANUAL] reply error:", e)
 
         # === 模組開關（美股 / 台股 / 虛擬貨幣）===
         m_toggle = re.match(r"^(美股|台股|虛擬貨幣)\s*(開啟|關閉)$", t)
@@ -321,6 +311,15 @@ async def line_webhook(request: Request):
         if t.startswith("顏色"):
             scheme = resolve_scheme(t)
             reply(set_color_scheme(scheme) if scheme else "請說明要切換到「台股」或「美股」配色。")
+            continue
+
+        # === 手動重發報表：早報 / 午報 / 晚報 / 夜報 ===
+        if t in ("早報","午報","晚報","夜報"):
+            phase_map = {"早報":"morning","午報":"noon","晚報":"evening","夜報":"night"}
+            ph = phase_map[t]
+            msg = compose_report(ph)
+            push_to_line(f"🪄 手動重發 {t}\n{msg}")
+            reply(f"{t}已重發（若訊息較長，請看最新推送）")
             continue
 
         # === 台股觀察清單操作 ===
@@ -414,7 +413,7 @@ async def line_webhook(request: Request):
             reply(f"{sym} 設定為{action}，並已監控 1 小時。"); continue
 
         # 預設回覆
-        reply("指令：台股｜台股清單｜加入台股 <代號>｜移除台股 <代號>｜台股新聞｜美股｜今日強勢｜今日弱勢｜新聞 <幣>｜顏色 台股/美股｜總覽｜版本核對｜版本差異｜模組狀態｜（美股/台股/虛擬貨幣）開啟/關閉")
+        reply("指令：早報｜午報｜晚報｜夜報｜台股｜台股清單｜加入台股 <代號>｜移除台股 <代號>｜台股新聞｜美股｜今日強勢｜今日弱勢｜新聞 <幣>｜顏色 台股/美股｜總覽｜版本核對｜版本差異｜模組狀態｜（美股/台股/虛擬貨幣）開啟/關閉")
 
     return {"messages": out}
 
@@ -520,4 +519,4 @@ def admin_news_score(symbol: str = "BTC"):
 
 @app.get("/admin/health")
 def admin_health():
-    return {"ok": True, "tag": "v8R9-WAKER", "ts": int(time.time())}
+    return {"ok": True, "tag": "v8R10-MANUAL", "ts": int(time.time())}
